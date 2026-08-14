@@ -189,7 +189,7 @@ class JackettExtend(_PluginBase):
             query_string = urlencode(params, quote_via=quote_plus)
             api_url = f"{self._host.rstrip('/')}/api/v2.0/indexers/{indexer_name}/results/torznab/?{query_string}"
 
-            result_array = self.__parse_torznab_xml(api_url)
+            result_array = self.__parse_torznab_xml(api_url, site)
 
             if not result_array:
                 logger.warning(f"【{self.plugin_name}】Indexer：\"{site.get('name')}\" 未检索到数据")
@@ -323,7 +323,7 @@ class JackettExtend(_PluginBase):
 
         pass
 
-    def __parse_torznab_xml(self, url) -> List[TorrentInfo]:
+    def __parse_torznab_xml(self, url, site: dict = None) -> List[TorrentInfo]:
         """
         从 torznab XML 中解析种子信息
         :param url: XML 数据的 URL
@@ -397,7 +397,8 @@ class JackettExtend(_PluginBase):
                         size=size,
                         seeders=seeders,
                         peers=peers,
-                        site_name=self.jackett_domain,
+                        # V3 适配：显示真实站点名（原版硬编码 jackett_domain 导致结果来源显示无意义域名）
+                        site_name=site.get("name", self.plugin_name) if site else self.plugin_name,
                         page_url=page_url,
                         # V3 适配：V3 的 TorrentInfo 为 @dataclass，不接受未声明字段 imdbid
                     )
