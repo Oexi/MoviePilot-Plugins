@@ -3,11 +3,12 @@
     "name": "JackettExtend",
     "description": "扩展检索以支持Jackett站点资源",
     "labels": "索引器,Jackett",
-    "version": "3.0.2",
+    "version": "3.0.3",
     "icon": "Jackett_A.png",
     "author": "jtcymc",
     "level": 1,
     "history": {
+      "v3.0.3": "修复音乐搜索无结果：搜索词对齐宿主清洗（去特殊字符，长词组/带符号标题可命中）；TorrentInfo 填充 category（MP 音乐匹配要求 torrent.category==MUSIC）",
       "v3.0.2": "移除 torznab cat 分类参数（大量 indexer 分类映射不标准，动漫音乐等非标准分类资源被过滤）",
       "v3.0.1": "修复音乐搜索无结果（get_cat 补音乐分类 3000）；搜索结果显示真实站点名；解析 Jackett caps 生成 category 支持音乐搜索站点列表；无条件覆盖注入升级即生效",
       "v3.0.0": "适配MoviePilot V3：修复 __update_config 丢失 enabled/proxy 导致重载后静默失效；移除 V3 dataclass 不支持的 imdbid 参数；注册 async_search_torrents 模块（V3 异步搜索链）",

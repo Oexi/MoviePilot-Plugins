@@ -30,7 +30,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.0.2"
+    plugin_version = "3.0.3"
     # 插件作者
     plugin_author = "jtcymc"
     # 作者主页
@@ -166,6 +166,10 @@ class JackettExtend(_PluginBase):
         results = []
         if not site or not keyword:
             return results
+        # V3 适配：对齐内置站搜索的搜索词清洗（__clear_search_text 去特殊字符）。
+        # 识别式搜索会构造"艺术家+完整标题"长词组，含 - 等符号在 nyaa 等站
+        # 全文匹配不到；清洗后（如 "Dear My Friend -まだ見ぬ未来へ-" → 去 -）
+        # 可正常命中。
         if site.get("name", "").split("-")[0] != self.plugin_name:
             return results
 
@@ -174,6 +178,8 @@ class JackettExtend(_PluginBase):
             logger.warning(f"【{self.plugin_name}】站点域名无法解析")
             return results
 
+        # 清洗搜索词（对齐宿主 modules/indexer 的 __clear_search_text）
+        keyword = StringUtils.clear(keyword, replace_word=" ", allow_space=True) if keyword else keyword
         indexer_name = domain.split(".")[-1]
         # V3 适配：不传 cat 分类参数。实测大量 Jackett indexer 分类映射不标准
         # （如 nyaa 动漫音乐映射到 150332/2020 等自定义分类），传 cat 会漏掉目标资源。
@@ -190,7 +196,7 @@ class JackettExtend(_PluginBase):
             query_string = urlencode(params, quote_via=quote_plus)
             api_url = f"{self._host.rstrip('/')}/api/v2.0/indexers/{indexer_name}/results/torznab/?{query_string}"
 
-            result_array = self.__parse_torznab_xml(api_url, site)
+            result_array = self.__parse_torznab_xml(api_url, site, mtype)
 
             if not result_array:
                 logger.warning(f"【{self.plugin_name}】Indexer：\"{site.get('name')}\" 未检索到数据")
@@ -327,7 +333,7 @@ class JackettExtend(_PluginBase):
 
         pass
 
-    def __parse_torznab_xml(self, url, site: dict = None) -> List[TorrentInfo]:
+    def __parse_torznab_xml(self, url, site: dict = None, mtype: Optional[MediaType] = None) -> List[TorrentInfo]:
         """
         从 torznab XML 中解析种子信息
         :param url: XML 数据的 URL
@@ -405,6 +411,12 @@ class JackettExtend(_PluginBase):
                         site_name=site.get("name", self.plugin_name) if site else self.plugin_name,
                         page_url=page_url,
                         # V3 适配：V3 的 TorrentInfo 为 @dataclass，不接受未声明字段 imdbid
+                        # V3 适配：填种子分类。MP 音乐匹配（_matching_music_torrents）要求
+                        # torrent.category == MUSIC，原版不填导致音乐搜索全部被过滤。
+                        # Jackett 的 torznab category 值（nyaa 150332/118685 等源 ID）与标准
+                        # 分类不一致，无法可靠映射，直接用宿主搜索 mtype 兜底（音乐搜索时
+                        # mtype 必为 MUSIC，再由上层标题+艺术家匹配筛除无关资源）。
+                        category=mtype.value if mtype else None,
                     )
                     torrents.append(tmp_dict)
                 except Exception as e:
