@@ -30,7 +30,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.0.1"
+    plugin_version = "3.0.2"
     # 插件作者
     plugin_author = "jtcymc"
     # 作者主页
@@ -175,7 +175,9 @@ class JackettExtend(_PluginBase):
             return results
 
         indexer_name = domain.split(".")[-1]
-        categories = self.get_cat(mtype)
+        # V3 适配：不传 cat 分类参数。实测大量 Jackett indexer 分类映射不标准
+        # （如 nyaa 动漫音乐映射到 150332/2020 等自定义分类），传 cat 会漏掉目标资源。
+        # 由 MoviePilot 上层按标题/媒体类型做匹配过滤。
 
         try:
             logger.info(f"【{self.plugin_name}】开始检索 Indexer：\"{site.get('name')}\"，关键词：\"{keyword}\"")
@@ -183,8 +185,7 @@ class JackettExtend(_PluginBase):
             params = {
                 "apikey": self._api_key,
                 "t": "search",
-                "q": keyword,
-                "cat": ",".join(map(str, categories))
+                "q": keyword
             }
             query_string = urlencode(params, quote_via=quote_plus)
             api_url = f"{self._host.rstrip('/')}/api/v2.0/indexers/{indexer_name}/results/torznab/?{query_string}"
