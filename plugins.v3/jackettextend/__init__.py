@@ -30,7 +30,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.0.3"
+    plugin_version = "3.0.4"
     # 插件作者
     plugin_author = "jtcymc"
     # 作者主页
@@ -166,10 +166,7 @@ class JackettExtend(_PluginBase):
         results = []
         if not site or not keyword:
             return results
-        # V3 适配：对齐内置站搜索的搜索词清洗（__clear_search_text 去特殊字符）。
-        # 识别式搜索会构造"艺术家+完整标题"长词组，含 - 等符号在 nyaa 等站
-        # 全文匹配不到；清洗后（如 "Dear My Friend -まだ見ぬ未来へ-" → 去 -）
-        # 可正常命中。
+
         if site.get("name", "").split("-")[0] != self.plugin_name:
             return results
 
@@ -178,8 +175,6 @@ class JackettExtend(_PluginBase):
             logger.warning(f"【{self.plugin_name}】站点域名无法解析")
             return results
 
-        # 清洗搜索词（对齐宿主 modules/indexer 的 __clear_search_text）
-        keyword = StringUtils.clear(keyword, replace_word=" ", allow_space=True) if keyword else keyword
         indexer_name = domain.split(".")[-1]
         # V3 适配：不传 cat 分类参数。实测大量 Jackett indexer 分类映射不标准
         # （如 nyaa 动漫音乐映射到 150332/2020 等自定义分类），传 cat 会漏掉目标资源。

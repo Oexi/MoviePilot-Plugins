@@ -67,7 +67,7 @@
 
 ---
 
-## MoviePilot V3 适配（JackettExtend v3.0.3）
+## MoviePilot V3 适配（JackettExtend v3.0.4）
 
 `plugins.v3/jackettextend` 为 V3 适配版，基于本仓库 v2 实现派生，仅包含 V3 必要适配：
 
@@ -77,7 +77,7 @@
 
 ### V3 使用流程
 
-1. V3 插件市场安装 JackettExtend（v3.0.3），配置 `host` / `api_key` / `password` 并启用
+1. V3 插件市场安装 JackettExtend（v3.0.4），配置 `host` / `api_key` / `password` 并启用
 2. 保存后插件自动从 Jackett 拉取 indexer 并注入宿主内存索引器
 3. 插件数据页（查看数据）复制站点注册域名，如 `https://jackett_extend.yts`
 4. Web 界面 → 站点管理 → 添加站点，粘贴该域名（V3 添加校验会命中插件注入的索引器）
