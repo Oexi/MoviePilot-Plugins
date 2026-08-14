@@ -64,3 +64,22 @@
 ---
 
 如需进一步完善或有特殊格式需求，请告知！
+
+---
+
+## MoviePilot V3 适配（JackettExtend v2.0.0）
+
+`plugins.v3/jackettextend` 为 V3 适配版，基于本仓库 v2 实现派生，仅包含 V3 必要适配：
+
+1. **`__update_config()` 写回全部配置项**：V3 的 `update_config()` 为整体替换，原版只写回 5 个字段会把 `enabled`/`proxy` 冲掉，导致插件重载后静默失效
+2. **移除 `TorrentInfo(imdbid=...)`**：V3 的 TorrentInfo 为 `@dataclass`，不接受未声明字段（V2 的 pydantic 模型允许），否则搜索结果解析全部异常
+3. **注册 `async_search_torrents` 模块**：V3 搜索链走异步模块调用，原版只注册 `search_torrents` 不会被执行
+
+### V3 使用流程
+
+1. V3 插件市场安装 JackettExtend（v2.0.0），配置 `host` / `api_key` / `password` 并启用
+2. 保存后插件自动从 Jackett 拉取 indexer 并注入宿主内存索引器
+3. 插件数据页（查看数据）复制站点注册域名，如 `https://jackett_extend.yts`
+4. Web 界面 → 站点管理 → 添加站点，粘贴该域名（V3 添加校验会命中插件注入的索引器）
+5. 系统设置 → 索引器 勾选启用该站点
+6. 搜索即命中 Jackett 资源
