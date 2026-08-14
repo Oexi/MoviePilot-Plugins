@@ -67,7 +67,7 @@
 
 ---
 
-## MoviePilot V3 适配（JackettExtend v2.0.0）
+## MoviePilot V3 适配（JackettExtend v3.0.0）
 
 `plugins.v3/jackettextend` 为 V3 适配版，基于本仓库 v2 实现派生，仅包含 V3 必要适配：
 
@@ -77,9 +77,15 @@
 
 ### V3 使用流程
 
-1. V3 插件市场安装 JackettExtend（v2.0.0），配置 `host` / `api_key` / `password` 并启用
+1. V3 插件市场安装 JackettExtend（v3.0.0），配置 `host` / `api_key` / `password` 并启用
 2. 保存后插件自动从 Jackett 拉取 indexer 并注入宿主内存索引器
 3. 插件数据页（查看数据）复制站点注册域名，如 `https://jackett_extend.yts`
 4. Web 界面 → 站点管理 → 添加站点，粘贴该域名（V3 添加校验会命中插件注入的索引器）
 5. 系统设置 → 索引器 勾选启用该站点
 6. 搜索即命中 Jackett 资源
+
+### V3 音乐搜索支持
+
+V3 音乐搜索的站点选择列表依赖索引器的 `category.music` 字段（电影/电视无声明时默认放行）。
+适配版在拉取 indexer 时解析 Jackett 返回的 `caps`（2000=电影 / 5000=电视 / 3000=音乐）生成 `category`，
+并在每次初始化时无条件覆盖注入宿主内存索引器，升级插件后无需重启即生效。

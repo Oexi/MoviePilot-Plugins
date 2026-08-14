@@ -30,7 +30,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "2.0.0"
+    plugin_version = "3.0.0"
     # 插件作者
     plugin_author = "jtcymc"
     # 作者主页
@@ -102,11 +102,12 @@ class JackettExtend(_PluginBase):
             self.get_status()
         for indexer in self._indexers:
             domain = indexer.get("domain", "")
-            site_info = self.sites_helper.get_indexer(domain)
-            if not site_info:
-                new_indexer = copy.deepcopy(indexer)
-                # sites_helper 添加
-                self.sites_helper.add_indexer(domain, new_indexer)
+            if not domain:
+                continue
+            new_indexer = copy.deepcopy(indexer)
+            # V3 适配：无条件覆盖注入（宿主 add_indexer 对同 domain 直接覆盖），
+            # 保证 category 等新增字段在宿主内存索引器中始终最新，升级插件后无需重启生效
+            self.sites_helper.add_indexer(domain, new_indexer)
 
     def get_status(self):
         """
@@ -261,6 +262,19 @@ class JackettExtend(_PluginBase):
                 if not indexer_id or not indexer_name:
                     continue
 
+                # V3 适配：解析 Jackett caps 生成媒体类型分类。
+                # V3 音乐搜索的站点列表依赖 indexer.category.music 字段，
+                # 无 category 的索引器在音乐搜索中被过滤（电影/电视默认放行）。
+                category = {}
+                for cap in (v.get("caps") or []):
+                    cap_id = str(cap.get("ID", ""))
+                    if cap_id.startswith("2000"):
+                        category["movie"] = True
+                    elif cap_id.startswith("5000"):
+                        category["tv"] = True
+                    elif cap_id.startswith("3000"):
+                        category["music"] = True
+
                 indexers.append({
                     "id": f'{self.plugin_name}-{indexer_name}',
                     "name": f'{self.plugin_name}-{indexer_name}',
@@ -268,6 +282,7 @@ class JackettExtend(_PluginBase):
                     "domain": self.jackett_domain.replace(self.plugin_author, str(indexer_id)),
                     "public": True,
                     "proxy": False,
+                    "category": category,
                 })
 
             return indexers
