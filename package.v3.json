@@ -3,11 +3,12 @@
     "name": "JackettExtend",
     "description": "扩展检索以支持Jackett站点资源",
     "labels": "索引器,Jackett",
-    "version": "3.0.5",
+    "version": "3.0.6",
     "icon": "Jackett_A.png",
     "author": "jtcymc",
     "level": 1,
     "history": {
+      "v3.0.6": "配置界面新增排除索引器(黑名单)输入框",
       "v3.0.5": "站点注册写入 site 表(SiteOper)兼容 main 架构搜索链;站点 url 规范化;新增黑名单排除索引器与过期站点同步清理",
       "v3.0.4": "移除多余的搜索词清洗（宿主已在搜索链统一清洗，内置站与插件站搜索词一致）；保留 category 填充",
       "v3.0.3": "修复音乐搜索无结果：搜索词对齐宿主清洗（去特殊字符，长词组/带符号标题可命中）；TorrentInfo 填充 category（MP 音乐匹配要求 torrent.category==MUSIC）",

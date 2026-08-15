@@ -30,7 +30,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.0.5"
+    plugin_version = "3.0.6"
     # 插件作者
     plugin_author = "jtcymc"
     # 作者主页
@@ -645,6 +645,24 @@ class JackettExtend(_PluginBase):
                                             'label': '更新周期',
                                             'placeholder': '0 0 */24 * *',
                                             'hint': '索引列表更新周期，支持5位cron表达式，默认每24小时运行一次'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 6
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'exclude_indexers',
+                                            'label': '排除索引器(黑名单)',
+                                            'placeholder': '0magnet,sukebeinyaasi',
+                                            'hint': '不注册到MoviePilot的Jackett索引器id，逗号分隔，留空注册全部'
                                         }
                                     }
                                 ]
