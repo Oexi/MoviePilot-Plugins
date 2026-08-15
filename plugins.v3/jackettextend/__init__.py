@@ -30,7 +30,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.1.2"
+    plugin_version = "3.1.3"
     # 插件作者
     plugin_author = "jtcymc"
     # 作者主页
@@ -231,6 +231,18 @@ class JackettExtend(_PluginBase):
         except Exception as e:
             logger.error(f"【{self.plugin_name}】注册站点 {domain} 到 DB 失败: {str(e)}")
 
+    def _parse_indexer_sites(self) -> list:
+        """
+        统一解析 indexer_sites 配置为小写 id 列表。
+        兼容：list(UI 多选)、逗号分隔字符串(API/旧格式)、None/其他类型。
+        """
+        sites = self._indexer_sites
+        if isinstance(sites, list):
+            return [str(x).strip().lower() for x in sites if str(x).strip()]
+        if isinstance(sites, str):
+            return [x.strip().lower() for x in sites.split(",") if x.strip()]
+        return []
+
     def search_torrents(self, site: dict, keyword: str, mtype: Optional[MediaType] = None,
                         cat: Optional[str] = None, page: Optional[int] = 0, **kwargs) -> \
             List[
@@ -342,7 +354,7 @@ class JackettExtend(_PluginBase):
             raw_indexers = ret.json()
             logger.info(f"【{self.plugin_name}】Jackett indexers: {[v.get('id') for v in raw_indexers]}")
             # 白名单过滤：勾选 indexer_sites 时仅保留选中的，留空添加全部
-            selected = [x.lower() for x in (self._indexer_sites or []) if x]
+            selected = self._parse_indexer_sites()
             indexers = []
             for v in raw_indexers:
                 indexer_id = v.get("id")
