@@ -30,7 +30,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.1.1"
+    plugin_version = "3.1.2"
     # 插件作者
     plugin_author = "jtcymc"
     # 作者主页
@@ -75,7 +75,13 @@ class JackettExtend(_PluginBase):
             self._enabled = config.get("enabled")
             self._proxy = config.get("proxy")
             self._onlyonce = config.get("onlyonce")
-            self._indexer_sites = config.get("indexer_sites") or ""
+            raw_sites = config.get("indexer_sites") or ""
+            if isinstance(raw_sites, list):
+                # UI 多选(VSelect multiple)保存为数组
+                self._indexer_sites = [str(x).strip() for x in raw_sites if str(x).strip()]
+            else:
+                # API/旧配置为逗号分隔字符串
+                self._indexer_sites = [x.strip() for x in str(raw_sites).split(",") if x.strip()]
             self._cron = config.get("cron") or "0 0 */24 * *"
         if not self._enabled:
             return
@@ -336,7 +342,7 @@ class JackettExtend(_PluginBase):
             raw_indexers = ret.json()
             logger.info(f"【{self.plugin_name}】Jackett indexers: {[v.get('id') for v in raw_indexers]}")
             # 白名单过滤：勾选 indexer_sites 时仅保留选中的，留空添加全部
-            selected = [x.strip().lower() for x in (self._indexer_sites or "").split(",") if x.strip()]
+            selected = [x.lower() for x in (self._indexer_sites or []) if x]
             indexers = []
             for v in raw_indexers:
                 indexer_id = v.get("id")
