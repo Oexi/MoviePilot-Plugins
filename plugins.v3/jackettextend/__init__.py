@@ -30,7 +30,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.0.9"
+    plugin_version = "3.0.10"
     # 插件作者
     plugin_author = "jtcymc"
     # 作者主页
@@ -344,9 +344,11 @@ class JackettExtend(_PluginBase):
                 if not indexer_id or not indexer_name:
                     continue
                 if exclude:
-                    # 包含匹配:exclude 项命中 原始id/显示名/合成名 任一即跳过(最宽容,填 sukebei 即可命中)
-                    combined = f"{str(indexer_id).lower()} {str(indexer_name).lower()} {f'{self.plugin_name}-{indexer_name}'.lower()}"
-                    if any(x in combined for x in exclude):
+                    # 精确匹配:exclude 项须完整命中 原始id/显示名/合成名 之一(避免 sukebei 误伤其他站)
+                    matchable = {str(indexer_id).lower(),
+                                 str(indexer_name).lower(),
+                                 f"{self.plugin_name}-{indexer_name}".lower()}
+                    if matchable & set(exclude):
                         logger.info(f"【{self.plugin_name}】黑名单跳过 indexer: {indexer_id}")
                         continue
 
