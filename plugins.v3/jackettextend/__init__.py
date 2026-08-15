@@ -30,7 +30,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.1.8"
+    plugin_version = "3.1.9"
     # 插件作者
     plugin_author = "jtcymc"
     # 作者主页
@@ -51,7 +51,6 @@ class JackettExtend(_PluginBase):
     _api_key = ""
     _password = ""
     _indexer_sites = ""
-    _onlyonce = False
     _indexers = []
     _fetch_ok = False
     sites_helper = None
@@ -75,7 +74,6 @@ class JackettExtend(_PluginBase):
             self._password = config.get("password")
             self._enabled = config.get("enabled")
             self._proxy = config.get("proxy")
-            self._onlyonce = config.get("onlyonce")
             raw_sites = config.get("indexer_sites") or ""
             if isinstance(raw_sites, list):
                 # UI 多选(VSelect multiple)保存为数组
@@ -89,21 +87,13 @@ class JackettExtend(_PluginBase):
         # 停止现有任务
         self.stop_service()
 
-        # 启动定时任务 & 立即运行一次
+        # 启动定时任务
         self._scheduler = BackgroundScheduler(timezone=settings.TZ)
         if self._cron:
             logger.info(f"【{self.plugin_name}】 索引更新服务启动，周期：{self._cron}")
             self._scheduler.add_job(self.__sync_all, CronTrigger.from_crontab(self._cron))
 
-        if self._onlyonce:
-            logger.info(f"【{self.plugin_name}】开始获取索引器状态")
-            self._scheduler.add_job(self.get_status, 'date',
-                                    run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3))
-            # 关闭一次性开关
-            self._onlyonce = False
-            self.__update_config()
-
-        if self._cron or self._onlyonce:
+        if self._cron:
             # 启动服务
             self._scheduler.print_jobs()
             self._scheduler.start()
@@ -188,7 +178,6 @@ class JackettExtend(_PluginBase):
         # V3 适配：宿主 update_config() 为整体替换，必须写回全部配置项，
         # 否则 enabled/proxy 丢失导致插件重载后静默失效
         self.update_config({
-            "onlyonce": False,
             "cron": self._cron,
             "host": self._host,
             "api_key": self._api_key,
@@ -609,7 +598,7 @@ class JackettExtend(_PluginBase):
                                         'component': 'VCol',
                                         'props': {
                                             'cols': 12,
-                                            'md': 4
+                                            'md': 6
                                         },
                                         'content': [
                                             {
@@ -625,7 +614,7 @@ class JackettExtend(_PluginBase):
                                         'component': 'VCol',
                                         'props': {
                                             'cols': 12,
-                                            'md': 4
+                                            'md': 6
                                         },
                                         'content': [
                                             {
@@ -637,23 +626,6 @@ class JackettExtend(_PluginBase):
                                             }
                                         ]
                                     },
-                                    {
-                                        'component': 'VCol',
-                                        'props': {
-                                            'cols': 12,
-                                            'md': 6
-                                        },
-                                        'content': [
-                                            {
-                                                'component': 'VSwitch',
-                                                'props': {
-                                                    'model': 'onlyonce',
-                                                    'label': '立即运行一次',
-                                                    'hint': '打开后立即运行一次获取索引器列表，否则需要等到预先设置的更新周期才会获取'
-                                                }
-                                            }
-                                        ]
-                                    }
                                 ]
                             },
 
@@ -774,26 +746,6 @@ class JackettExtend(_PluginBase):
                                     {
                                         'component': 'VAlert',
                                         'props': {
-                                            'type': 'success',
-                                            'variant': 'tonal',
-                                            'text': '将“查看数据”列表中 “站点domain” => 站点管理 新增站点 站点名+ https://或http:// 直接新增'}
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VAlert',
-                                        'props': {
                                             'type': 'info',
                                             'variant': 'tonal',
                                             'text': '该种方式扩建检索，无法进行站点连通性监测，官方默认方式添加的正常不影响！'
@@ -813,8 +765,7 @@ class JackettExtend(_PluginBase):
             "host": "",
             "api_key": "",
             "password": "",
-            "cron": "0 0 * * *",
-            "onlyonce": False
+            "cron": "0 0 * * *"
         }
 
     def _ensure_sites_loaded(self) -> bool:
