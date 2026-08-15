@@ -30,7 +30,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.1.5"
+    plugin_version = "3.1.6"
     # 插件作者
     plugin_author = "jtcymc"
     # 作者主页
@@ -396,7 +396,8 @@ class JackettExtend(_PluginBase):
                 indexer_name = v.get("name")
                 if not indexer_id or not indexer_name:
                     continue
-                if filter_selected and selected and str(indexer_id).lower() not in selected:
+                if filter_selected and selected and str(indexer_id).lower() not in selected \
+                        and f"{self.plugin_name}-{indexer_name}".lower() not in selected:
                     logger.info(f"【{self.plugin_name}】白名单跳过 indexer: {indexer_id}")
                     continue
 
@@ -415,6 +416,7 @@ class JackettExtend(_PluginBase):
 
                 indexers.append({
                     "id": f'{self.plugin_name}-{indexer_name}',
+                    "indexer_id": indexer_id,
                     "name": f'{self.plugin_name}-{indexer_name}',
                     "url": f'{self._host.rstrip("/")}/api/v2.0/indexers/{indexer_id}/results/torznab/',
                     "domain": self.jackett_domain.replace(self.plugin_author, str(indexer_id)),
@@ -565,8 +567,8 @@ class JackettExtend(_PluginBase):
         site_options = []
         try:
             for idx in self.get_indexers(filter_selected=False):
-                site_options.append({"title": f"{idx.get('name', '')} ({idx.get('id', '')})",
-                                     "value": idx.get('id', '')})
+                site_options.append({"title": f"{idx.get('name', '')} ({idx.get('indexer_id', '')})",
+                                     "value": idx.get('indexer_id') or idx.get('id', '')})
         except Exception as e:
             logger.warning(f"【{self.plugin_name}】获取索引器选项失败: {str(e)}")
         return [
