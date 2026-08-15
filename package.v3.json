@@ -3,11 +3,12 @@
     "name": "JackettExtend",
     "description": "扩展检索以支持Jackett站点资源",
     "labels": "索引器,Jackett",
-    "version": "3.0.8",
+    "version": "3.0.9",
     "icon": "Jackett_A.png",
     "author": "jtcymc",
     "level": 1,
     "history": {
+      "v3.0.9": "每次初始化重新拉取indexer列表,黑名单变更保存即生效(无需重启)",
       "v3.0.8": "黑名单改为包含匹配(填部分id即可命中);拉取时日志输出实际indexer id列表",
       "v3.0.7": "黑名单支持原始id/显示名/合成名匹配;拉取失败时保护不清除已有站点",
       "v3.0.6": "配置界面新增排除索引器(黑名单)输入框",

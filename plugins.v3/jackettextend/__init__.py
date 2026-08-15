@@ -30,7 +30,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.0.8"
+    plugin_version = "3.0.9"
     # 插件作者
     plugin_author = "jtcymc"
     # 作者主页
@@ -100,8 +100,9 @@ class JackettExtend(_PluginBase):
             # 启动服务
             self._scheduler.print_jobs()
             self._scheduler.start()
-        if not self._indexers:
-            self.get_status()
+        # 每次初始化都重新拉取:插件实例存活期间 _indexers 会保留旧数据,
+        # 仅 `if not self._indexers` 会导致黑名单变更/Jackett 增删不生效(需重启才生效)
+        self.get_status()
         for indexer in self._indexers:
             domain = indexer.get("domain", "")
             if not domain:
