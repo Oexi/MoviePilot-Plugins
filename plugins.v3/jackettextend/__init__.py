@@ -30,7 +30,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.0.7"
+    plugin_version = "3.0.8"
     # 插件作者
     plugin_author = "jtcymc"
     # 作者主页
@@ -333,6 +333,7 @@ class JackettExtend(_PluginBase):
                 return []
 
             raw_indexers = ret.json()
+            logger.info(f"【{self.plugin_name}】Jackett indexers: {[v.get('id') for v in raw_indexers]}")
             # 黑名单过滤：不注册到 MP 的 indexer（按 Jackett 原始 id，逗号分隔）
             exclude = [x.strip().lower() for x in (self._exclude_indexers or "").split(",") if x.strip()]
             indexers = []
@@ -342,11 +343,9 @@ class JackettExtend(_PluginBase):
                 if not indexer_id or not indexer_name:
                     continue
                 if exclude:
-                    # 黑名单支持三种标识:Jackett原始id(0magnet)、站点显示名(Free JAV Torrent)、合成名(JackettExtend-0Magnet)
-                    matchable = {str(indexer_id).lower(),
-                                 str(indexer_name).lower(),
-                                 f"{self.plugin_name}-{indexer_name}".lower()}
-                    if matchable & set(exclude):
+                    # 包含匹配:exclude 项命中 原始id/显示名/合成名 任一即跳过(最宽容,填 sukebei 即可命中)
+                    combined = f"{str(indexer_id).lower()} {str(indexer_name).lower()} {f'{self.plugin_name}-{indexer_name}'.lower()}"
+                    if any(x in combined for x in exclude):
                         logger.info(f"【{self.plugin_name}】黑名单跳过 indexer: {indexer_id}")
                         continue
 
