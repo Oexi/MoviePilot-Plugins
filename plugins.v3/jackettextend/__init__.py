@@ -30,7 +30,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.1.0"
+    plugin_version = "3.1.1"
     # 插件作者
     plugin_author = "jtcymc"
     # 作者主页
@@ -50,7 +50,7 @@ class JackettExtend(_PluginBase):
     _host = ""
     _api_key = ""
     _password = ""
-    _exclude_indexers = ""
+    _indexer_sites = ""
     _onlyonce = False
     _indexers = []
     sites_helper = None
@@ -75,7 +75,7 @@ class JackettExtend(_PluginBase):
             self._enabled = config.get("enabled")
             self._proxy = config.get("proxy")
             self._onlyonce = config.get("onlyonce")
-            self._exclude_indexers = config.get("exclude_indexers") or ""
+            self._indexer_sites = config.get("indexer_sites") or ""
             self._cron = config.get("cron") or "0 0 */24 * *"
         if not self._enabled:
             return
@@ -122,14 +122,14 @@ class JackettExtend(_PluginBase):
             self.__register_site(indexer)
 
         # 同步清理：删除 site 表中属于插件但不在当前 indexers 列表的站点
-        # （黑名单过滤生效 / Jackett 删除 indexer 后，旧注册记录不会自动消失）
+        # （白名单变更 / Jackett 删除 indexer 后，旧注册记录不会自动消失）
         # 保护：仅当本次拉取成功(非空)才清理，拉取失败时不动已有站点
         if self._indexers:
             self.__sync_remove_stale_sites()
 
     def __sync_remove_stale_sites(self):
         """
-        清理插件已注册但不再需要的站点记录（黑名单/Jackett 变更）
+        清理插件已注册但不再需要的站点记录（白名单/Jackett 变更）
         """
         try:
             try:
@@ -184,7 +184,7 @@ class JackettExtend(_PluginBase):
             "host": self._host,
             "api_key": self._api_key,
             "password": self._password,
-            "exclude_indexers": self._exclude_indexers,
+            "indexer_sites": self._indexer_sites,
             "enabled": self._enabled,
             "proxy": self._proxy,
         })
@@ -293,7 +293,7 @@ class JackettExtend(_PluginBase):
         else:
             return [2000, 5000]
 
-    def get_indexers(self):
+    def get_indexers(self, filter_selected: bool = True):
         """
         获取配置的 Jackett Indexer 信息
         :return: Indexer 列表，每项包含 id、name、url、domain、public、proxy、parser
@@ -335,17 +335,16 @@ class JackettExtend(_PluginBase):
 
             raw_indexers = ret.json()
             logger.info(f"【{self.plugin_name}】Jackett indexers: {[v.get('id') for v in raw_indexers]}")
-            # 黑名单过滤：不注册到 MP 的 indexer（按 Jackett 原始 id，逗号分隔）
-            exclude = [x.strip().lower() for x in (self._exclude_indexers or "").split(",") if x.strip()]
+            # 白名单过滤：勾选 indexer_sites 时仅保留选中的，留空添加全部
+            selected = [x.strip().lower() for x in (self._indexer_sites or "").split(",") if x.strip()]
             indexers = []
             for v in raw_indexers:
                 indexer_id = v.get("id")
                 indexer_name = v.get("name")
                 if not indexer_id or not indexer_name:
                     continue
-                if exclude and str(indexer_id).lower() in exclude:
-                    # 仅精确匹配 Jackett 原始索引器 ID(如 sukebeinyaasi/0magnet)
-                    logger.info(f"【{self.plugin_name}】黑名单跳过 indexer: {indexer_id}")
+                if filter_selected and selected and str(indexer_id).lower() not in selected:
+                    logger.info(f"【{self.plugin_name}】白名单跳过 indexer: {indexer_id}")
                     continue
 
                 # V3 适配：解析 Jackett caps 生成媒体类型分类。
@@ -509,6 +508,14 @@ class JackettExtend(_PluginBase):
         """
         拼装插件配置页面，需要返回两块数据：1、页面配置；2、数据结构
         """
+        # 动态生成索引器多选选项(完整列表,不受白名单过滤影响,否则无法取消勾选)
+        site_options = []
+        try:
+            for idx in self.get_indexers(filter_selected=False):
+                site_options.append({"title": f"{idx.get('name', '')} ({idx.get('id', '')})",
+                                     "value": idx.get('id', '')})
+        except Exception as e:
+            logger.warning(f"【{self.plugin_name}】获取索引器选项失败: {str(e)}")
         return [
             {
                 'component': 'VForm',
@@ -662,12 +669,14 @@ class JackettExtend(_PluginBase):
                                 },
                                 'content': [
                                     {
-                                        'component': 'VTextField',
+                                        'component': 'VSelect',
                                         'props': {
-                                            'model': 'exclude_indexers',
-                                            'label': '排除索引器(黑名单)',
-                                            'placeholder': 'thepiratebay,therarbg',
-                                            'hint': '不注册到MoviePilot的Jackett索引器id，逗号分隔，留空注册全部'
+                                            'model': 'indexer_sites',
+                                            'label': '添加索引器(留空=全部)',
+                                            'hint': '勾选后仅添加选中的Jackett索引器，未选中的排除；留空添加全部',
+                                            'chips': True,
+                                            'multiple': True,
+                                            'items': site_options
                                         }
                                     }
                                 ]
