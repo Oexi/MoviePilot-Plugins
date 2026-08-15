@@ -30,7 +30,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.1.4"
+    plugin_version = "3.1.5"
     # 插件作者
     plugin_author = "jtcymc"
     # 作者主页
@@ -53,6 +53,7 @@ class JackettExtend(_PluginBase):
     _indexer_sites = ""
     _onlyonce = False
     _indexers = []
+    _fetch_ok = False
     sites_helper = None
     # 仅用于标识，避免重复注册
     jackett_domain = "jackett_extend.jtcymc"
@@ -129,8 +130,8 @@ class JackettExtend(_PluginBase):
 
         # 同步清理：删除 site 表中属于插件但不在当前 indexers 列表的站点
         # （白名单变更 / Jackett 删除 indexer 后，旧注册记录不会自动消失）
-        # 保护：仅当本次拉取成功(非空)才清理，拉取失败时不动已有站点
-        if self._indexers:
+        # 保护：仅当本次拉取成功才清理；请求失败时不动已有站点
+        if self._fetch_ok:
             self.__sync_remove_stale_sites()
 
     def __sync_remove_stale_sites(self):
@@ -160,7 +161,9 @@ class JackettExtend(_PluginBase):
         if not self._api_key or not self._host:
             return False
         self._indexers = self.get_indexers()
-        return True if isinstance(self._indexers, list) and len(self._indexers) > 0 else False
+        # 拉取成功标志：请求链路正常即为成功（过滤后为空也视为成功，可安全清理）
+        self._fetch_ok = isinstance(self._indexers, list)
+        return True if self._fetch_ok and len(self._indexers) > 0 else False
 
     def get_state(self) -> bool:
         return self._enabled
