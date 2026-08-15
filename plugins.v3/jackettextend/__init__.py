@@ -30,7 +30,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.0.10"
+    plugin_version = "3.1.0"
     # 插件作者
     plugin_author = "jtcymc"
     # 作者主页
@@ -343,14 +343,10 @@ class JackettExtend(_PluginBase):
                 indexer_name = v.get("name")
                 if not indexer_id or not indexer_name:
                     continue
-                if exclude:
-                    # 精确匹配:exclude 项须完整命中 原始id/显示名/合成名 之一(避免 sukebei 误伤其他站)
-                    matchable = {str(indexer_id).lower(),
-                                 str(indexer_name).lower(),
-                                 f"{self.plugin_name}-{indexer_name}".lower()}
-                    if matchable & set(exclude):
-                        logger.info(f"【{self.plugin_name}】黑名单跳过 indexer: {indexer_id}")
-                        continue
+                if exclude and str(indexer_id).lower() in exclude:
+                    # 仅精确匹配 Jackett 原始索引器 ID(如 sukebeinyaasi/0magnet)
+                    logger.info(f"【{self.plugin_name}】黑名单跳过 indexer: {indexer_id}")
+                    continue
 
                 # V3 适配：解析 Jackett caps 生成媒体类型分类。
                 # V3 音乐搜索的站点列表依赖 indexer.category.music 字段，
@@ -670,7 +666,7 @@ class JackettExtend(_PluginBase):
                                         'props': {
                                             'model': 'exclude_indexers',
                                             'label': '排除索引器(黑名单)',
-                                            'placeholder': '0magnet,sukebeinyaasi',
+                                            'placeholder': 'thepiratebay,therarbg',
                                             'hint': '不注册到MoviePilot的Jackett索引器id，逗号分隔，留空注册全部'
                                         }
                                     }
