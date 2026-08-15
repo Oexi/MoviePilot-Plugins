@@ -30,7 +30,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.0.6"
+    plugin_version = "3.0.7"
     # 插件作者
     plugin_author = "jtcymc"
     # 作者主页
@@ -122,7 +122,9 @@ class JackettExtend(_PluginBase):
 
         # 同步清理：删除 site 表中属于插件但不在当前 indexers 列表的站点
         # （黑名单过滤生效 / Jackett 删除 indexer 后，旧注册记录不会自动消失）
-        self.__sync_remove_stale_sites()
+        # 保护：仅当本次拉取成功(非空)才清理，拉取失败时不动已有站点
+        if self._indexers:
+            self.__sync_remove_stale_sites()
 
     def __sync_remove_stale_sites(self):
         """
@@ -339,9 +341,14 @@ class JackettExtend(_PluginBase):
                 indexer_name = v.get("name")
                 if not indexer_id or not indexer_name:
                     continue
-                if exclude and str(indexer_id).lower() in exclude:
-                    logger.info(f"【{self.plugin_name}】黑名单跳过 indexer: {indexer_id}")
-                    continue
+                if exclude:
+                    # 黑名单支持三种标识:Jackett原始id(0magnet)、站点显示名(Free JAV Torrent)、合成名(JackettExtend-0Magnet)
+                    matchable = {str(indexer_id).lower(),
+                                 str(indexer_name).lower(),
+                                 f"{self.plugin_name}-{indexer_name}".lower()}
+                    if matchable & set(exclude):
+                        logger.info(f"【{self.plugin_name}】黑名单跳过 indexer: {indexer_id}")
+                        continue
 
                 # V3 适配：解析 Jackett caps 生成媒体类型分类。
                 # V3 音乐搜索的站点列表依赖 indexer.category.music 字段，
