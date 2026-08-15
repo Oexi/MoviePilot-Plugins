@@ -3,11 +3,12 @@
     "name": "JackettExtend",
     "description": "扩展检索以支持Jackett站点资源",
     "labels": "索引器,Jackett",
-    "version": "3.1.6",
+    "version": "3.1.7",
     "icon": "Jackett_A.png",
     "author": "jtcymc",
     "level": 1,
     "history": {
+      "v3.1.7": "自动清理Jackett已移除索引器的勾选残留",
       "v3.1.6": "修复白名单勾选值与索引器id不匹配导致过滤失败",
       "v3.1.5": "修复过滤后为空时旧站点不清理;白名单清洗引号碎片",
       "v3.1.4": "修复白名单被宿主二次解析为带引号碎片导致过滤失效",

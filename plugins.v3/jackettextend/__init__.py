@@ -30,7 +30,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.1.6"
+    plugin_version = "3.1.7"
     # 插件作者
     plugin_author = "jtcymc"
     # 作者主页
@@ -110,6 +110,9 @@ class JackettExtend(_PluginBase):
         # 每次初始化都重新拉取:插件实例存活期间 _indexers 会保留旧数据,
         # 仅 `if not self._indexers` 会导致黑名单变更/Jackett 增删不生效(需重启才生效)
         self.get_status()
+        # 清理配置中已被 Jackett 移除的勾选(避免 UI 残留失效索引器)
+        if self._fetch_ok:
+            self.__cleanup_stale_selection()
         for indexer in self._indexers:
             domain = indexer.get("domain", "")
             if not domain:
@@ -274,6 +277,30 @@ class JackettExtend(_PluginBase):
                 return [x.strip().lower() for x in quoted if x.strip()]
             return [x.strip().lower() for x in s.split(",") if x.strip()]
         return []
+
+    def __cleanup_stale_selection(self):
+        """
+        移除 indexer_sites 中已被 Jackett 删除的索引器勾选，
+        避免配置界面已勾选区域残留失效索引器（下拉 items 已无对应项）。
+        """
+        try:
+            if not self._indexer_sites:
+                return
+            valid = set()
+            for i in self._indexers:
+                iid = str(i.get("indexer_id") or "").strip().lower()
+                sid = str(i.get("id") or "").strip().lower()
+                if iid:
+                    valid.add(iid)
+                if sid:
+                    valid.add(sid)
+            stale = [x for x in self._indexer_sites if str(x).strip().lower() not in valid]
+            if stale:
+                self._indexer_sites = [x for x in self._indexer_sites if str(x).strip().lower() in valid]
+                self.__update_config()
+                logger.info(f"【{self.plugin_name}】已清理失效勾选: {stale}")
+        except Exception as e:
+            logger.error(f"【{self.plugin_name}】清理失效勾选失败: {str(e)}")
 
     def search_torrents(self, site: dict, keyword: str, mtype: Optional[MediaType] = None,
                         cat: Optional[str] = None, page: Optional[int] = 0, **kwargs) -> \
