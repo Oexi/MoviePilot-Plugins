@@ -30,7 +30,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.1.7"
+    plugin_version = "3.1.8"
     # 插件作者
     plugin_author = "jtcymc"
     # 作者主页
@@ -83,7 +83,7 @@ class JackettExtend(_PluginBase):
             else:
                 # API/旧配置为逗号分隔字符串
                 self._indexer_sites = [x.strip() for x in str(raw_sites).split(",") if x.strip()]
-            self._cron = config.get("cron") or "0 0 */24 * *"
+            self._cron = config.get("cron") or "0 0 * * *"
         if not self._enabled:
             return
         # 停止现有任务
@@ -93,7 +93,7 @@ class JackettExtend(_PluginBase):
         self._scheduler = BackgroundScheduler(timezone=settings.TZ)
         if self._cron:
             logger.info(f"【{self.plugin_name}】 索引更新服务启动，周期：{self._cron}")
-            self._scheduler.add_job(self.get_status, CronTrigger.from_crontab(self._cron))
+            self._scheduler.add_job(self.__sync_all, CronTrigger.from_crontab(self._cron))
 
         if self._onlyonce:
             logger.info(f"【{self.plugin_name}】开始获取索引器状态")
@@ -107,35 +107,8 @@ class JackettExtend(_PluginBase):
             # 启动服务
             self._scheduler.print_jobs()
             self._scheduler.start()
-        # 每次初始化都重新拉取:插件实例存活期间 _indexers 会保留旧数据,
-        # 仅 `if not self._indexers` 会导致黑名单变更/Jackett 增删不生效(需重启才生效)
-        self.get_status()
-        # 清理配置中已被 Jackett 移除的勾选(避免 UI 残留失效索引器)
-        if self._fetch_ok:
-            self.__cleanup_stale_selection()
-        for indexer in self._indexers:
-            domain = indexer.get("domain", "")
-            if not domain:
-                continue
-            new_indexer = copy.deepcopy(indexer)
-            # V3 适配：无条件覆盖注入（宿主 add_indexer 对同 domain 直接覆盖），
-            # 保证 category 等新增字段在宿主内存索引器中始终最新，升级插件后无需重启生效
-            try:
-                if hasattr(self.sites_helper, 'add_indexer'):
-                    self.sites_helper.add_indexer(domain, new_indexer)
-                else:
-                    logger.warning(f"【{self.plugin_name}】宿主 SitesHelper 无 add_indexer，跳过注入: {domain}")
-            except Exception as e:
-                logger.error(f"【{self.plugin_name}】注入站点 {domain} 失败: {str(e)}")
-            # V3 适配：显式写入 site 表（SiteOper），搜索链从 DB 读取有效站点，
-            # 仅 add_indexer 注入内存时（GitHub main 的 Cython SitesHelper 不写 DB）站点不可见
-            self.__register_site(indexer)
-
-        # 同步清理：删除 site 表中属于插件但不在当前 indexers 列表的站点
-        # （白名单变更 / Jackett 删除 indexer 后，旧注册记录不会自动消失）
-        # 保护：仅当本次拉取成功才清理；请求失败时不动已有站点
-        if self._fetch_ok:
-            self.__sync_remove_stale_sites()
+        # 每次初始化都重新拉取并完整同步(拉取/注册/清理,与定时任务共用 __sync_all)
+        self.__sync_all()
 
     def __sync_remove_stale_sites(self):
         """
@@ -167,6 +140,30 @@ class JackettExtend(_PluginBase):
         # 拉取成功标志：请求链路正常即为成功（过滤后为空也视为成功，可安全清理）
         self._fetch_ok = isinstance(self._indexers, list)
         return True if self._fetch_ok and len(self._indexers) > 0 else False
+
+    def __sync_all(self):
+        """
+        完整同步：拉取索引器列表 → 清理失效勾选 → 注册/注入 → 清理过期站点。
+        定时任务与初始化共用，确保 Jackett 变更(新增/移除/白名单)自动同步到 MP。
+        """
+        self.get_status()
+        if not self._fetch_ok:
+            return
+        self.__cleanup_stale_selection()
+        for indexer in self._indexers:
+            domain = indexer.get("domain", "")
+            if not domain:
+                continue
+            new_indexer = copy.deepcopy(indexer)
+            try:
+                if hasattr(self.sites_helper, 'add_indexer'):
+                    self.sites_helper.add_indexer(domain, new_indexer)
+                else:
+                    logger.warning(f"【{self.plugin_name}】宿主 SitesHelper 无 add_indexer，跳过注入: {domain}")
+            except Exception as e:
+                logger.error(f"【{self.plugin_name}】注入站点 {domain} 失败: {str(e)}")
+            self.__register_site(indexer)
+        self.__sync_remove_stale_sites()
 
     def get_state(self) -> bool:
         return self._enabled
@@ -737,7 +734,7 @@ class JackettExtend(_PluginBase):
                                         'props': {
                                             'model': 'cron',
                                             'label': '更新周期',
-                                            'placeholder': '0 0 */24 * *',
+                                            'placeholder': '0 0 * * *',
                                             'hint': '索引列表更新周期，支持5位cron表达式，默认每24小时运行一次'
                                         }
                                     }
@@ -816,7 +813,7 @@ class JackettExtend(_PluginBase):
             "host": "",
             "api_key": "",
             "password": "",
-            "cron": "0 0 */24 * *",
+            "cron": "0 0 * * *",
             "onlyonce": False
         }
 
