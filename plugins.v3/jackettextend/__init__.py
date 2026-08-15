@@ -30,7 +30,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.1.3"
+    plugin_version = "3.1.4"
     # 插件作者
     plugin_author = "jtcymc"
     # 作者主页
@@ -238,9 +238,38 @@ class JackettExtend(_PluginBase):
         """
         sites = self._indexer_sites
         if isinstance(sites, list):
-            return [str(x).strip().lower() for x in sites if str(x).strip()]
+            # 宿主可能把字符串化的 list 二次解析为带引号/括号的碎片元素，
+            # 如 ["['thepiratebay'", "'therarbg']"]，逐个剥引号清洗
+            import re
+            cleaned = []
+            for x in sites:
+                x = str(x).strip()
+                m = re.findall(r"[\'\"]([^\'\"]+)[\'\"]", x)
+                if m:
+                    x = m[-1]
+                else:
+                    x = x.strip("[]'\" ")
+                x = x.strip().lower()
+                if x:
+                    cleaned.append(x)
+            return cleaned
         if isinstance(sites, str):
-            return [x.strip().lower() for x in sites.split(",") if x.strip()]
+            s = sites.strip()
+            # 方法1：字符串化的 list，如 "['thepiratebay', 'therarbg']"
+            if s.startswith("[") and s.endswith("]"):
+                try:
+                    import ast
+                    parsed = ast.literal_eval(s)
+                    if isinstance(parsed, list):
+                        return [str(x).strip().lower() for x in parsed if str(x).strip()]
+                except Exception:
+                    pass
+            # 方法2：正则提取引号包裹的 id（兼容任何引号类型/额外字符）
+            import re
+            quoted = re.findall(r"[\'\"]([^\'\"]+)[\'\"]", s)
+            if quoted:
+                return [x.strip().lower() for x in quoted if x.strip()]
+            return [x.strip().lower() for x in s.split(",") if x.strip()]
         return []
 
     def search_torrents(self, site: dict, keyword: str, mtype: Optional[MediaType] = None,
@@ -355,6 +384,9 @@ class JackettExtend(_PluginBase):
             logger.info(f"【{self.plugin_name}】Jackett indexers: {[v.get('id') for v in raw_indexers]}")
             # 白名单过滤：勾选 indexer_sites 时仅保留选中的，留空添加全部
             selected = self._parse_indexer_sites()
+            logger.info(f"【{self.plugin_name}】白名单原始配置: {self._indexer_sites!r}")
+            if selected:
+                logger.info(f"【{self.plugin_name}】白名单 selected: {selected}")
             indexers = []
             for v in raw_indexers:
                 indexer_id = v.get("id")
