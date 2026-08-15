@@ -30,7 +30,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.0.4"
+    plugin_version = "3.0.5"
     # 插件作者
     plugin_author = "jtcymc"
     # 作者主页
@@ -50,6 +50,7 @@ class JackettExtend(_PluginBase):
     _host = ""
     _api_key = ""
     _password = ""
+    _exclude_indexers = ""
     _onlyonce = False
     _indexers = []
     sites_helper = None
@@ -74,6 +75,7 @@ class JackettExtend(_PluginBase):
             self._enabled = config.get("enabled")
             self._proxy = config.get("proxy")
             self._onlyonce = config.get("onlyonce")
+            self._exclude_indexers = config.get("exclude_indexers") or ""
             self._cron = config.get("cron") or "0 0 */24 * *"
         if not self._enabled:
             return
@@ -107,7 +109,39 @@ class JackettExtend(_PluginBase):
             new_indexer = copy.deepcopy(indexer)
             # V3 适配：无条件覆盖注入（宿主 add_indexer 对同 domain 直接覆盖），
             # 保证 category 等新增字段在宿主内存索引器中始终最新，升级插件后无需重启生效
-            self.sites_helper.add_indexer(domain, new_indexer)
+            try:
+                if hasattr(self.sites_helper, 'add_indexer'):
+                    self.sites_helper.add_indexer(domain, new_indexer)
+                else:
+                    logger.warning(f"【{self.plugin_name}】宿主 SitesHelper 无 add_indexer，跳过注入: {domain}")
+            except Exception as e:
+                logger.error(f"【{self.plugin_name}】注入站点 {domain} 失败: {str(e)}")
+            # V3 适配：显式写入 site 表（SiteOper），搜索链从 DB 读取有效站点，
+            # 仅 add_indexer 注入内存时（GitHub main 的 Cython SitesHelper 不写 DB）站点不可见
+            self.__register_site(indexer)
+
+        # 同步清理：删除 site 表中属于插件但不在当前 indexers 列表的站点
+        # （黑名单过滤生效 / Jackett 删除 indexer 后，旧注册记录不会自动消失）
+        self.__sync_remove_stale_sites()
+
+    def __sync_remove_stale_sites(self):
+        """
+        清理插件已注册但不再需要的站点记录（黑名单/Jackett 变更）
+        """
+        try:
+            try:
+                from app.db.site_oper import SiteOper
+            except ImportError:
+                from app.db.oper.site import SiteOper
+            current_domains = {i.get("domain", "") for i in self._indexers if i.get("domain")}
+            prefix = f"{self.jackett_domain.split('.')[0]}."
+            site_oper = SiteOper()
+            for site in site_oper.list():
+                if site.domain and site.domain.startswith(prefix) and site.domain not in current_domains:
+                    site_oper.delete(site.id)
+                    logger.info(f"【{self.plugin_name}】已清理过期站点记录: {site.domain}")
+        except Exception as e:
+            logger.error(f"【{self.plugin_name}】清理过期站点失败: {str(e)}")
 
     def get_status(self):
         """
@@ -147,9 +181,46 @@ class JackettExtend(_PluginBase):
             "host": self._host,
             "api_key": self._api_key,
             "password": self._password,
+            "exclude_indexers": self._exclude_indexers,
             "enabled": self._enabled,
             "proxy": self._proxy,
         })
+
+    def __register_site(self, indexer: dict):
+        """
+        V3 适配：将 Jackett indexer 注册为站点写入 DB（site 表）。
+        搜索链从 DB 读取有效站点，仅 add_indexer 注入内存时站点不可见。
+        """
+        domain = indexer.get("domain", "")
+        if not domain:
+            return
+        try:
+            # 双架构兼容：V2/V3 镜像旧路径由宿主 compat 层路由到规范路径
+            from app.db.site_oper import SiteOper
+            from app.core.event import eventmanager, EventType
+            site_oper = SiteOper()
+            exists = site_oper.get_by_domain(domain)
+            payload = {
+                "name": indexer.get("name", ""),
+                "domain": domain,
+                # 站点地址必须与插件"查看数据"给出的格式一致(https://jackett_extend.xxx/),
+                # 官方 add_site 同样校正为 {scheme}://{netloc}/;torznab API 地址会导致校验失败
+                "url": f"https://{domain}/",
+                "public": 1 if indexer.get("public") else 0,
+                "proxy": 1 if indexer.get("proxy") else 0,
+                "is_active": True,
+                "pri": 1,
+            }
+            if exists:
+                site_oper.update(exists.id, payload)
+                logger.info(f"【{self.plugin_name}】已更新站点记录: {domain}")
+            else:
+                site_oper.add(**payload)
+                logger.info(f"【{self.plugin_name}】已注册站点到 DB: {domain}")
+            # 通知宿主刷新站点缓存
+            eventmanager.send_event(EventType.SiteUpdated, {"domain": domain})
+        except Exception as e:
+            logger.error(f"【{self.plugin_name}】注册站点 {domain} 到 DB 失败: {str(e)}")
 
     def search_torrents(self, site: dict, keyword: str, mtype: Optional[MediaType] = None,
                         cat: Optional[str] = None, page: Optional[int] = 0, **kwargs) -> \
@@ -260,11 +331,16 @@ class JackettExtend(_PluginBase):
                 return []
 
             raw_indexers = ret.json()
+            # 黑名单过滤：不注册到 MP 的 indexer（按 Jackett 原始 id，逗号分隔）
+            exclude = [x.strip().lower() for x in (self._exclude_indexers or "").split(",") if x.strip()]
             indexers = []
             for v in raw_indexers:
                 indexer_id = v.get("id")
                 indexer_name = v.get("name")
                 if not indexer_id or not indexer_name:
+                    continue
+                if exclude and str(indexer_id).lower() in exclude:
+                    logger.info(f"【{self.plugin_name}】黑名单跳过 indexer: {indexer_id}")
                     continue
 
                 # V3 适配：解析 Jackett caps 生成媒体类型分类。
@@ -290,6 +366,7 @@ class JackettExtend(_PluginBase):
                     "category": category,
                 })
 
+            logger.info(f"【{self.plugin_name}】获取到 {len(indexers)} 个 Jackett indexers")
             return indexers
 
         except Exception as e:
