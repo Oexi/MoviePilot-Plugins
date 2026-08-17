@@ -48,7 +48,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.2.0"
+    plugin_version = "3.2.1"
     # 插件作者
     plugin_author = "jtcymc"
     # 作者主页
@@ -473,8 +473,21 @@ class JackettExtend(_PluginBase):
             params = {
                 "apikey": self._api_key,
                 "t": "search",
-                "q": keyword
+                "q": keyword,
             }
+            # BUGFIX: 透传用户在站点浏览弹窗中显式选择的分类 ID。
+            # 宿主 /site/{id}/category 返回的条目 id 会以逗号分隔字符串回传
+            # (如 "2000,3000")，Jackett torznab cat 参数同样接受该格式，
+            # 让 UI 分类筛选真实生效；未显式选择时不传 cat，
+            # 保持按标题/媒体类型兜底过滤的既有语义。
+            cat_value = str(cat or "").strip()
+            if cat_value:
+                cat_value = re.sub(r"\s+", "", cat_value)
+                if re.fullmatch(r"\d+(,\d+)*", cat_value):
+                    params["cat"] = cat_value
+                else:
+                    logger.debug(
+                        f"【{self.plugin_name}】忽略非分类 ID 格式的 cat 参数：{cat_value!r}")
             query_string = urlencode(params, quote_via=quote_plus)
             api_url = f"{self._host.rstrip('/')}/api/v2.0/indexers/{indexer_id}/results/torznab/?{query_string}"
 
@@ -626,19 +639,29 @@ class JackettExtend(_PluginBase):
                 continue
 
             # V3 适配：解析 Jackett caps 生成媒体类型分类。
+            # 宿主索引器契约要求 category 为 {media_type: [分类条目 dict]}，
+            # 条目含 id(选择后回传的分类 ID)与 cat/desc(展示名)。
+            # 之前用布尔 True 占位虽能通过媒体类型列表的 truthy 判断，
+            # 但点击站点打开浏览弹窗时，宿主 GET /site/{id}/category 会迭代
+            # category.values() 并把每个值当作条目列表，布尔值触发
+            # 'bool' object is not iterable，页面弹出"未知错误"。
             # V3 音乐搜索的站点列表依赖 indexer.category.music 字段，
             # 无 category 的索引器在音乐搜索中被过滤（电影/电视默认放行）。
             category = {}
             for cap in (v.get("caps") or []):
                 if not isinstance(cap, dict):
                     continue
-                cap_id = str(cap.get("ID", ""))
+                cap_id = str(cap.get("ID", "")).strip()
+                if not cap_id:
+                    continue
+                cap_name = str(cap.get("Name") or "").strip() or cap_id
+                entry = {"id": cap_id, "cat": cap_name, "desc": cap_name}
                 if cap_id.startswith("2000"):
-                    category["movie"] = True
+                    category.setdefault("movie", []).append(entry)
                 elif cap_id.startswith("5000"):
-                    category["tv"] = True
+                    category.setdefault("tv", []).append(entry)
                 elif cap_id.startswith("3000"):
-                    category["music"] = True
+                    category.setdefault("music", []).append(entry)
 
             # E5: public 由 Jackett privacy 字段判断;proxy 与插件配置联动
             privacy = str(v.get("privacy") or "").strip().lower()
