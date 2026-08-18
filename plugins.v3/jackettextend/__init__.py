@@ -23,10 +23,10 @@ except ImportError:
     except ImportError:
         SitesHelper = None
 
-from app.core.context import TorrentInfo
-from app.log import logger
+from app.sdk.media import TorrentInfo
+from app.sdk.logging import logger
 from app.plugins import _PluginBase
-from app.core.config import settings
+from app.sdk.config import settings
 from app.schemas import MediaType
 try:
     from app.schemas import MediaSource
@@ -35,9 +35,9 @@ except ImportError:
         from app.schemas.types import MediaSource
     except ImportError:
         MediaSource = None
-from app.utils.dom import DomUtils
-from app.utils.http import RequestUtils
-from app.utils.string import StringUtils
+from app.sdk.utilities import DomUtils
+from app.sdk.network import RequestUtils
+from app.sdk.utilities import StringUtils
 
 
 class JackettExtend(_PluginBase):
@@ -170,7 +170,8 @@ class JackettExtend(_PluginBase):
             except ImportError:
                 from app.db.oper.site import SiteOper
             try:
-                from app.core.event import eventmanager, EventType
+                from app.sdk.events import eventmanager
+                from app.schemas.types import EventType
             except ImportError:
                 eventmanager = None
                 EventType = None
@@ -291,7 +292,8 @@ class JackettExtend(_PluginBase):
             except ImportError:
                 from app.db.oper.site import SiteOper
             try:
-                from app.core.event import eventmanager, EventType
+                from app.sdk.events import eventmanager
+                from app.schemas.types import EventType
             except ImportError:
                 eventmanager = None
                 EventType = None
