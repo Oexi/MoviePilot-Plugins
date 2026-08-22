@@ -50,7 +50,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.2.3"
+    plugin_version = "3.2.4"
     # 插件作者
     plugin_author = "jtcymc"
     # 作者主页
@@ -468,6 +468,7 @@ class JackettExtend(_PluginBase):
 
         # D4: keyword 为空时使用 Jackett 空查询获取最新资源(refresh_torrents/RSS 刷新)
         keyword = keyword or ""
+        keyword = StringUtils.clear(text=keyword, replace_word=" ", allow_space=True)
         masked_keyword = self.__mask_keyword(keyword)
         api_url = ""
         try:

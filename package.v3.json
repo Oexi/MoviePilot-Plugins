@@ -3,11 +3,12 @@
     "name": "JackettExtend",
     "description": "扩展检索以支持Jackett站点资源",
     "labels": "索引器,Jackett",
-    "version": "3.2.3",
+    "version": "3.2.4",
     "icon": "Jackett_A.png",
     "author": "jtcymc",
     "level": 1,
     "history": {
+      "v3.2.4": "修复插件 provider 在宿主搜索词清理前被调用的例外：构造 Jackett Torznab q 前复用 MoviePilot 官方标点清理，使插件与内置索引器搜索语义一致",
       "v3.2.3": "通用处理 Jackett Torznab 下载字段：优先保留可校验的 HTTP torrent 链接，magnet-only 结果原样降级且不猜测站点地址，并对错误响应和日志凭据作安全处理",
       "v3.2.2": "插件 import 迁移至 V3 稳定 SDK(app.sdk.*): 消除 app.core*/app.utils*/app.log 兼容债务, 行为零变化(仅内部代码质量)",
       "v3.2.1": "修复点击 Jackett 站点浏览时宿主 GET /site/{id}/category 报 'bool' object is not iterable：索引器 category 改为宿主契约的 {媒体类型: [分类条目]} 结构(布尔 True 会被端点当列表迭代)；分类条目携带 id/cat/desc；浏览弹窗显式选择的分类 ID 透传给 torznab cat 参数使筛选真实生效",
