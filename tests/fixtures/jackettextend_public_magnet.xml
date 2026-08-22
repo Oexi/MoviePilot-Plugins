@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss xmlns:torznab="http://torznab.com/schemas/2015/feed">
+  <channel>
+    <item>
+      <title>Public indexer release</title>
+      <guid>magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567</guid>
+      <link>magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567</link>
+      <comments>https://public-indexer.invalid/release/42</comments>
+      <enclosure url="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567" length="2048" type="application/x-bittorrent" />
+      <torznab:attr name="magneturl" value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567" />
+      <torznab:attr name="infohash" value="0123456789abcdef0123456789abcdef01234567" />
+      <torznab:attr name="files" value="23" />
+    </item>
+  </channel>
+</rss>

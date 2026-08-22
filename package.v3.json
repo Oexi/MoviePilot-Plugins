@@ -3,11 +3,12 @@
     "name": "JackettExtend",
     "description": "扩展检索以支持Jackett站点资源",
     "labels": "索引器,Jackett",
-    "version": "3.2.2",
+    "version": "3.2.3",
     "icon": "Jackett_A.png",
     "author": "jtcymc",
     "level": 1,
     "history": {
+      "v3.2.3": "通用处理 Jackett Torznab 下载字段：优先保留可校验的 HTTP torrent 链接，magnet-only 结果原样降级且不猜测站点地址，并对错误响应和日志凭据作安全处理",
       "v3.2.2": "插件 import 迁移至 V3 稳定 SDK(app.sdk.*): 消除 app.core*/app.utils*/app.log 兼容债务, 行为零变化(仅内部代码质量)",
       "v3.2.1": "修复点击 Jackett 站点浏览时宿主 GET /site/{id}/category 报 'bool' object is not iterable：索引器 category 改为宿主契约的 {媒体类型: [分类条目]} 结构(布尔 True 会被端点当列表迭代)；分类条目携带 id/cat/desc；浏览弹窗显式选择的分类 ID 透传给 torznab cat 参数使筛选真实生效",
       "v3.2.0": "修复拉取失败/空结果被误判为成功并清空勾选、删除全部站点;站点识别改用 domain 前缀并支持带点 id;种子 size/seeders/peers 类型转换及 pubdate/促销因子/HR/imdb 媒体身份填充;空关键词支持获取最新资源;注册 get_search_page_size 声明不支持翻页并去重保护;索引器列表 TTL 缓存;登录移除 URL 参数中的密码且空密码跳过;隐私/代理联动;30s 超时;并发锁与定时任务防重入;cron 表达式校验回退;双路径导入 SitesHelper;表单布局与文案修复",

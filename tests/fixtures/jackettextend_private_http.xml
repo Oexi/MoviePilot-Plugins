@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss xmlns:torznab="http://torznab.com/schemas/2015/feed">
+  <channel>
+    <item>
+      <title>Private indexer release</title>
+      <guid>https://tracker.invalid/details/42</guid>
+      <link>http://jackett.invalid:9117/dl/private-cardigann/?jackett_apikey=fixture&amp;path=protected</link>
+      <comments>https://tracker.invalid/details/42</comments>
+      <enclosure url="http://jackett.invalid:9117/dl/private-cardigann/?jackett_apikey=fixture&amp;path=protected" length="1024" type="application/x-bittorrent" />
+      <torznab:attr name="files" value="7" />
+    </item>
+  </channel>
+</rss>

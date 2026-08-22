@@ -39,6 +39,8 @@ from app.sdk.utilities import DomUtils
 from app.sdk.network import RequestUtils
 from app.sdk.utilities import StringUtils
 
+from ._torznab import is_usable_torznab_response, redact_url, select_torznab_enclosure
+
 
 class JackettExtend(_PluginBase):
     # 插件名称
@@ -48,7 +50,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.2.2"
+    plugin_version = "3.2.3"
     # 插件作者
     plugin_author = "jtcymc"
     # 作者主页
@@ -507,7 +509,7 @@ class JackettExtend(_PluginBase):
             # D8: 异常日志附带 URL/站点/关键词(脱敏)/异常类型
             logger.error(
                 f"【{self.plugin_name}】检索出错：site={site.get('name')}, indexer={indexer_id}, "
-                f"url={api_url or '-'}, 关键词={masked_keyword or '-'}, "
+                f"url={redact_url(api_url) if api_url else '-'}, 关键词={masked_keyword or '-'}, "
                 f"类型={type(e).__name__}：{str(e)}")
 
         return results
@@ -760,37 +762,26 @@ class JackettExtend(_PluginBase):
         """
         if not url:
             return []
+        log_url = redact_url(url)
         try:
             # F2: 超时由 60s 降至 30s;不加重试,避免放大重复请求
             ret = RequestUtils(timeout=30).get_res(url,
                                                    proxies=settings.PROXY if self._proxy else None)
         except Exception as e:
-            logger.error(f"【{self.plugin_name}】torznab 请求异常：url={url}, 类型={type(e).__name__}：{str(e)}")
+            # requests 异常文本可能回显带 apikey 的原始 URL，仅记录异常类型。
+            logger.error(f"【{self.plugin_name}】torznab 请求异常：url={log_url}, 类型={type(e).__name__}")
             return []
-        if ret is None or not ret.text:
-            logger.debug(f"【{self.plugin_name}】torznab 空响应：url={url}")
+        if ret is None:
+            logger.debug(f"【{self.plugin_name}】torznab 空响应：url={log_url}")
             return []
 
         # F1: 校验状态码与 Content-Type;JSON 错误体不进 XML 解析
         content_type = (ret.headers.get("Content-Type") or "").lower()
-        if ret.status_code != 200:
-            detail = f"HTTP {ret.status_code}"
-            if "json" in content_type:
-                try:
-                    err_body = ret.json()
-                    if isinstance(err_body, dict) and err_body.get("error"):
-                        detail = f"{detail}, error={err_body.get('error')}"
-                except Exception:
-                    pass
-            logger.warning(f"【{self.plugin_name}】Jackett torznab API 错误：url={url}, {detail}")
-            return []
-        if "json" in content_type:
-            try:
-                err_body = ret.json()
-            except Exception:
-                err_body = None
-            error = err_body.get("error") if isinstance(err_body, dict) else None
-            logger.warning(f"【{self.plugin_name}】Jackett 返回 JSON 错误体而非 torznab XML：url={url}, error={error!r}")
+        if not is_usable_torznab_response(ret.status_code, content_type, ret.text):
+            logger.warning(
+                f"【{self.plugin_name}】Jackett torznab 响应不可用："
+                f"url={log_url}, HTTP={ret.status_code}, content_type={content_type or '-'}"
+            )
             return []
 
         torrents = []
@@ -803,7 +794,7 @@ class JackettExtend(_PluginBase):
             items = root_node.getElementsByTagName("item")
         except Exception as e:
             # F1: XML 解析失败降为 WARNING,不输出完整 traceback 刷屏
-            logger.warning(f"【{self.plugin_name}】torznab XML 解析失败：url={url}, 类型={type(e).__name__}：{str(e)}")
+            logger.warning(f"【{self.plugin_name}】torznab XML 解析失败：url={log_url}, 类型={type(e).__name__}：{str(e)}")
             return []
 
         for item in items:
@@ -814,8 +805,8 @@ class JackettExtend(_PluginBase):
                     continue
                 # 种子链接
                 enclosure = DomUtils.tag_value(item, "enclosure", "url", default="")
-                if not enclosure:
-                    continue
+                link = DomUtils.tag_value(item, "link", default="")
+                guid = DomUtils.tag_value(item, "guid", default="")
                 # 描述
                 description = DomUtils.tag_value(item, "description", default="")
                 # 种子大小
@@ -836,6 +827,7 @@ class JackettExtend(_PluginBase):
                 uploadvolumefactor = None
                 downloadvolumefactor = None
                 hit_and_run = False
+                magnet_url = ""
 
                 torznab_attrs = item.getElementsByTagName("torznab:attr")
                 for torznab_attr in torznab_attrs:
@@ -853,6 +845,17 @@ class JackettExtend(_PluginBase):
                         hit_and_run = str(value).strip().lower() in ("1", "true", "yes")
                     elif name == "imdbid":
                         imdbid = str(value).strip()
+                    elif name == "magneturl":
+                        magnet_url = value
+
+                enclosure = select_torznab_enclosure(
+                    enclosure=enclosure,
+                    link=link,
+                    magnet_url=magnet_url,
+                    guid=guid,
+                )
+                if not enclosure:
+                    continue
 
                 # D3: imdbid 映射为 media_source/media_id 媒体身份
                 media_source = None
@@ -885,7 +888,7 @@ class JackettExtend(_PluginBase):
                     media_id=media_id,
                     # V3 适配：填种子分类。MP 音乐匹配（_matching_music_torrents）要求
                     # torrent.category == MUSIC，原版不填导致音乐搜索全部被过滤。
-                    # Jackett 的 torznab category 值（nyaa 150332/118685 等源 ID）与标准
+                    # Jackett 的 torznab category 值（部分索引器会使用源站分类 ID）与标准
                     # 分类不一致，无法可靠映射，直接用宿主搜索 mtype 兜底（音乐搜索时
                     # mtype 必为 MUSIC，再由上层标题+艺术家匹配筛除无关资源）。
                     category=mtype.value if mtype else None,
@@ -894,7 +897,7 @@ class JackettExtend(_PluginBase):
             except Exception as e:
                 # D8: item 级解析异常附带 URL 与异常类型,降为 DEBUG 避免刷屏
                 logger.debug(
-                    f"【{self.plugin_name}】torznab item 解析失败,已跳过：url={url}, "
+                    f"【{self.plugin_name}】torznab item 解析失败,已跳过：url={log_url}, "
                     f"类型={type(e).__name__}：{str(e)}")
                 continue
 
