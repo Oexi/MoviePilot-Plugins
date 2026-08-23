@@ -12,6 +12,27 @@ _SENSITIVE_QUERY_KEYS = {
 }
 
 
+def classify_torznab_response(status_code: object, content_type: object,
+                              text: object) -> str:
+    """Classify a Torznab response without retaining its body.
+
+    The category is intentionally small and stable so callers can expose a
+    useful diagnostic (or log line) without echoing an API response that may
+    contain credentials or provider-specific details.
+    """
+    try:
+        status = int(status_code)
+    except (TypeError, ValueError):
+        return "http_error"
+    if status != 200:
+        return "http_error"
+    if not isinstance(text, str) or not text.strip():
+        return "empty"
+    if "json" in str(content_type or "").lower():
+        return "json"
+    return "ok"
+
+
 def _supported_url(value: object, schemes: tuple[str, ...]) -> Optional[str]:
     """Return a Torznab URL only when its scheme is explicitly supported."""
     if not isinstance(value, str):
@@ -63,14 +84,7 @@ def select_torznab_enclosure(
 
 def is_usable_torznab_response(status_code: object, content_type: object, text: object) -> bool:
     """Reject empty, unauthorized, and JSON responses before XML parsing."""
-    try:
-        if int(status_code) != 200:
-            return False
-    except (TypeError, ValueError):
-        return False
-    if not isinstance(text, str) or not text.strip():
-        return False
-    return "json" not in str(content_type or "").lower()
+    return classify_torznab_response(status_code, content_type, text) == "ok"
 
 
 def redact_url(url: object) -> str:
@@ -79,10 +93,18 @@ def redact_url(url: object) -> str:
         return ""
     try:
         parsed = urlsplit(url)
+        # URL userinfo is not needed for diagnostics and must never be
+        # copied into logs.  Keep only the host/port portion of netloc.
+        hostname = parsed.hostname or ""
+        if hostname and ":" in hostname and not hostname.startswith("["):
+            hostname = f"[{hostname}]"
+        netloc = hostname
+        if parsed.port:
+            netloc = f"{netloc}:{parsed.port}"
         query = urlencode([
             (key, "***" if key.lower() in _SENSITIVE_QUERY_KEYS else value)
             for key, value in parse_qsl(parsed.query, keep_blank_values=True)
         ])
-        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, parsed.fragment))
+        return urlunsplit((parsed.scheme, netloc, parsed.path, query, parsed.fragment))
     except (TypeError, ValueError):
         return "<invalid-url>"
