@@ -9,6 +9,10 @@ _SENSITIVE_QUERY_KEYS = {
     "jackett_apikey",
     "password",
     "token",
+    # Search terms may contain titles, names, or other user-provided
+    # sensitive text.  Keep the key visible for diagnostics but never echo
+    # its value in a log URL.
+    "q",
 }
 
 

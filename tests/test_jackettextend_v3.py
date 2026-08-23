@@ -2,6 +2,7 @@ import asyncio
 import importlib.util
 import inspect
 import sys
+import threading
 import types
 import unittest
 import xml.dom.minidom
@@ -164,6 +165,8 @@ class JackettV3ContractTest(unittest.TestCase):
             self.assertEqual(module.JackettExtend._normalize_timeout(-1), 5)
             self.assertEqual(module.JackettExtend._normalize_timeout(999), 120)
             self.assertEqual(module.JackettExtend._normalize_timeout("bad"), 30)
+            for value in (float("inf"), float("-inf"), float("nan")):
+                self.assertEqual(module.JackettExtend._normalize_timeout(value), 30)
             plugin = object.__new__(module.JackettExtend)
             plugin._indexers_cache = []
             plugin._indexers_cache_ts = 1
@@ -178,6 +181,191 @@ class JackettV3ContractTest(unittest.TestCase):
                     return any(contains_timeout(child) for child in node)
                 return False
             self.assertTrue(contains_timeout(form))
+
+    def test_keyword_mask_does_not_retain_original_prefix(self):
+        with loaded_module() as module:
+            masked = module.JackettExtend._JackettExtend__mask_keyword("Secret Title")
+            self.assertNotIn("Secret", masked)
+            self.assertNotIn("Title", masked)
+            self.assertIn("(12)", masked)
+
+    def test_whitelist_serializations_become_canonical_ids(self):
+        with loaded_module() as module:
+            plugin = object.__new__(module.JackettExtend)
+            for raw in (
+                ["Nyaa", " AnimeTosho "],
+                "Nyaa, AnimeTosho",
+                "['Nyaa', 'AnimeTosho']",
+                ["['Nyaa'", "'AnimeTosho']"],
+                "['[\\\"Nyaa\\\", \\\"AnimeTosho\\\"]']",
+            ):
+                plugin._indexer_sites = raw
+                self.assertEqual(plugin._parse_indexer_sites(), ["nyaa", "animetosho"])
+
+            plugin.stop_service = lambda: None
+            plugin.init_plugin({
+                "enabled": False,
+                "indexer_sites": "['Nyaa', 'AnimeTosho']",
+            })
+            self.assertEqual(plugin._indexer_sites, ["nyaa", "animetosho"])
+            self.assertTrue(plugin._indexer_sites_explicit)
+
+    def test_indexer_profiles_filter_bad_rows_and_encode_special_ids(self):
+        with loaded_module() as module:
+            plugin = object.__new__(module.JackettExtend)
+
+            class Response:
+                status_code = 200
+                headers = {"Content-Type": "application/json"}
+                text = "[]"
+
+                @staticmethod
+                def json():
+                    return [
+                        None,
+                        {"id": "foo.bar/baz", "name": "Special", "privacy": "public", "caps": []},
+                    ]
+
+            class Request:
+                def __init__(self, *args, **kwargs):
+                    self.kwargs = kwargs
+
+                def get_res(self, *_args, **_kwargs):
+                    return Response()
+
+            original = module.RequestUtils
+            module.RequestUtils = Request
+            try:
+                result = plugin._JackettExtend__fetch_indexers({
+                    "host": "https://jackett.invalid",
+                    "api_key": "key",
+                    "password": "",
+                    "proxy": False,
+                    "timeout": 30,
+                })
+            finally:
+                module.RequestUtils = original
+            self.assertEqual(len(result), 1)
+            self.assertEqual(result[0]["indexer_id"], "foo.bar/baz")
+            self.assertIn("foo.bar%2Fbaz", result[0]["url"])
+            self.assertIn("foo.bar%2Fbaz", result[0]["domain"])
+
+    def test_finite_all_stale_whitelist_never_becomes_all(self):
+        with loaded_module() as module:
+            plugin = object.__new__(module.JackettExtend)
+            plugin._indexer_sites = ["removed"]
+            plugin._indexer_sites_explicit = True
+            selected = plugin._apply_indexer_selection([
+                {"indexer_id": "nyaa", "domain": "jackett_extend.nyaa"},
+            ])
+            self.assertEqual(selected, [])
+
+    def test_sync_captures_generation_config_snapshot_before_status(self):
+        with loaded_module() as module:
+            plugin = object.__new__(module.JackettExtend)
+            plugin._sync_stop_event = __import__("threading").Event()
+            plugin._sync_generation = 7
+            plugin._config_snapshot = {
+                "host": "https://old.invalid",
+                "api_key": "old-key",
+                "password": "old-password",
+                "proxy": True,
+                "timeout": 17,
+            }
+            captured = {}
+
+            def status(generation=None, config_snapshot=None):
+                captured.update(config_snapshot or {})
+                return False
+
+            plugin.get_status = status
+            plugin._JackettExtend__sync_all(generation=7)
+            self.assertEqual(captured["host"], "https://old.invalid")
+            self.assertEqual(captured["api_key"], "old-key")
+            self.assertEqual(captured["password"], "old-password")
+            self.assertTrue(captured["proxy"])
+            self.assertEqual(captured["timeout"], 17)
+
+    def test_stale_generation_cannot_commit_cache_state_or_side_effects(self):
+        with loaded_module() as module:
+            plugin = object.__new__(module.JackettExtend)
+            plugin._sync_stop_event = threading.Event()
+            plugin._sync_generation = 11
+            plugin._config_snapshot = {
+                "host": "https://old.invalid",
+                "api_key": "old-key",
+                "password": "old-password",
+                "proxy": False,
+                "timeout": 17,
+            }
+            cached = [{"indexer_id": "cached"}]
+            authoritative = [{"indexer_id": "current"}]
+            selected = [{"indexer_id": "selected"}]
+            plugin._indexers_cache = cached
+            plugin._indexers_cache_ts = 123.0
+            plugin._authoritative_indexers = authoritative
+            plugin._indexers = selected
+            plugin._fetch_ok = True
+            plugin._sync_ready = True
+            plugin._last_sync_ok = True
+            plugin._indexer_sites = []
+            entered = threading.Event()
+            release = threading.Event()
+            side_effects = []
+
+            def delayed_fetch(config_snapshot=None, generation=None):
+                entered.set()
+                self.assertTrue(release.wait(2))
+                return [{
+                    "indexer_id": "stale-result",
+                    "domain": "jackett_extend.stale-result",
+                }]
+
+            plugin._JackettExtend__fetch_indexers = delayed_fetch
+            plugin._JackettExtend__register_site = (
+                lambda *_args, **_kwargs: side_effects.append("register")
+            )
+            plugin._JackettExtend__sync_remove_stale_sites = (
+                lambda *_args, **_kwargs: side_effects.append("cleanup")
+            )
+            worker = threading.Thread(
+                target=plugin._JackettExtend__sync_all,
+                kwargs={"generation": 11},
+            )
+            worker.start()
+            self.assertTrue(entered.wait(2))
+            with plugin._state_lock:
+                plugin._sync_generation = 12
+            release.set()
+            worker.join(2)
+
+            self.assertFalse(worker.is_alive())
+            self.assertIs(plugin._indexers_cache, cached)
+            self.assertEqual(plugin._indexers_cache_ts, 123.0)
+            self.assertIs(plugin._authoritative_indexers, authoritative)
+            self.assertIs(plugin._indexers, selected)
+            self.assertTrue(plugin._last_sync_ok)
+            self.assertEqual(side_effects, [])
+
+    def test_none_config_clears_previous_credentials_and_defaults(self):
+        with loaded_module() as module:
+            plugin = object.__new__(module.JackettExtend)
+            plugin.stop_service = lambda: None
+            plugin._host = "https://old.invalid"
+            plugin._api_key = "old-key"
+            plugin._password = "old-password"
+            plugin._enabled = True
+            plugin._proxy = True
+            plugin._timeout = 99
+            plugin._indexer_sites = ["nyaa"]
+            plugin.init_plugin(None)
+            self.assertEqual(plugin._host, "")
+            self.assertEqual(plugin._api_key, "")
+            self.assertEqual(plugin._password, "")
+            self.assertFalse(plugin._enabled)
+            self.assertFalse(plugin._proxy)
+            self.assertEqual(plugin._timeout, 30)
+            self.assertEqual(plugin._indexer_sites, [])
 
     def test_diagnostic_endpoint_never_returns_credentials(self):
         with loaded_module() as module:
@@ -213,7 +401,9 @@ class JackettV3ContractTest(unittest.TestCase):
                 <torznab:attr xmlns:torznab='http://torznab.com/schemas/2015/feed' name='infohash' value='abc'/>
                 <torznab:attr xmlns:torznab='http://torznab.com/schemas/2015/feed' name='label' value='trusted'/>
               </item>
-              <item><title>Duplicate</title><guid>same-guid</guid><enclosure url='https://site/two.torrent'/></item>
+              <item><title>Different infohash, same GUID</title><guid>same-guid</guid><enclosure url='https://site/two.torrent'/>
+                <torznab:attr xmlns:torznab='http://torznab.com/schemas/2015/feed' name='infohash' value='different-hash'/>
+              </item>
               <item><title>Two</title><guid>unique-guid</guid><enclosure url='magnet:?xt=urn:btih:def'/></item>
             </channel></rss>"""
             plugin = object.__new__(module.JackettExtend)
@@ -226,7 +416,7 @@ class JackettV3ContractTest(unittest.TestCase):
                 site={"id": 3, "name": "Nyaa", "cookie": "cookie", "ua": "ua", "proxy": True, "pri": 2},
                 mtype=_MediaType.MUSIC,
             )
-            self.assertEqual(len(result), 2)
+            self.assertEqual(len(result), 3)
             self.assertEqual(result[0].grabs, 7)
             self.assertEqual(result[0].site, 3)
             self.assertEqual(result[0].site_cookie, "cookie")
@@ -234,6 +424,61 @@ class JackettV3ContractTest(unittest.TestCase):
             self.assertEqual(result[0].labels, ["trusted"])
             self.assertEqual(result[0].category, "音乐")
             self.assertEqual(_RequestUtils.timeouts[-1], 12)
+
+    def test_parser_duplicate_infohash_prefers_http_torrent_over_magnet(self):
+        with loaded_module() as module:
+            _RequestUtils.response = _Response()
+            _RequestUtils.response.text = """<?xml version='1.0'?><rss><channel>
+              <item><title>Magnet first</title><guid>g1</guid><enclosure url='magnet:?xt=urn:btih:same'/>
+                <torznab:attr xmlns:torznab='http://torznab.com/schemas/2015/feed' name='infohash' value='same'/>
+              </item>
+              <item><title>HTTP second</title><guid>g2</guid><enclosure url='https://site/dl/same.torrent'/>
+                <torznab:attr xmlns:torznab='http://torznab.com/schemas/2015/feed' name='infohash' value='same'/>
+              </item>
+            </channel></rss>"""
+            plugin = object.__new__(module.JackettExtend)
+            plugin._timeout = 12
+            plugin._proxy = False
+            plugin._last_error = None
+            plugin._state_lock = module.JackettExtend._state_lock
+            result = plugin._JackettExtend__parse_torznab_xml(
+                "https://jackett.invalid/results?q=private-title&apikey=secret",
+                site={"name": "Nyaa"},
+            )
+            self.assertEqual(len(result), 1)
+            self.assertEqual(result[0].title, "HTTP second")
+            self.assertTrue(result[0].enclosure.startswith("https://"))
+
+    def test_parser_rejects_doctype_and_oversized_body(self):
+        with loaded_module() as module:
+            plugin = object.__new__(module.JackettExtend)
+            plugin._timeout = 12
+            plugin._proxy = False
+            plugin._last_error = None
+            plugin._state_lock = module.JackettExtend._state_lock
+            for body in (
+                "<!DOCTYPE rss [<!ENTITY x 'expanded'>]><rss><channel></channel></rss>",
+                "<rss><channel>" + "x" * (module.JackettExtend.TORZNAB_MAX_XML_BYTES + 1) + "</channel></rss>",
+            ):
+                _RequestUtils.response = _Response()
+                _RequestUtils.response.text = body
+                self.assertEqual(
+                    plugin._JackettExtend__parse_torznab_xml("https://jackett.invalid/results?q=x"),
+                    [],
+                )
+
+            plugin.TORZNAB_MAX_ITEMS = 1
+            _RequestUtils.response = _Response()
+            _RequestUtils.response.text = (
+                "<rss><channel>"
+                "<item><title>One</title><enclosure url='https://site/one.torrent'/></item>"
+                "<item><title>Two</title><enclosure url='https://site/two.torrent'/></item>"
+                "</channel></rss>"
+            )
+            self.assertEqual(
+                plugin._JackettExtend__parse_torznab_xml("https://jackett.invalid/results?q=x"),
+                [],
+            )
 
     def test_empty_snapshot_cannot_trigger_destructive_cleanup(self):
         with loaded_module() as module:
@@ -259,6 +504,31 @@ class JackettV3ContractTest(unittest.TestCase):
             plugin._JackettExtend__sync_all(generation=1)
             self.assertEqual(called, [])
 
+    def test_sync_stage_failure_keeps_last_sync_ok_false(self):
+        with loaded_module() as module:
+            plugin = object.__new__(module.JackettExtend)
+            plugin._sync_stop_event = __import__("threading").Event()
+            plugin._sync_generation = 9
+            plugin._fetch_ok = True
+            plugin._sync_ready = True
+            plugin._authoritative_indexers = [
+                {"indexer_id": "nyaa", "domain": "jackett_extend.nyaa"},
+            ]
+            plugin._indexers = list(plugin._authoritative_indexers)
+            plugin._indexer_sites = []
+
+            class BrokenSites:
+                @staticmethod
+                def add_indexer(*_args, **_kwargs):
+                    raise RuntimeError("broken helper")
+
+            plugin.sites_helper = BrokenSites()
+            plugin.get_status = lambda generation=None, config_snapshot=None: True
+            plugin._JackettExtend__register_site = lambda *_args, **_kwargs: False
+            plugin._JackettExtend__sync_remove_stale_sites = lambda *_args, **_kwargs: True
+            plugin._JackettExtend__sync_all(generation=9)
+            self.assertFalse(plugin._last_sync_ok)
+
     def test_old_generation_is_rejected_after_reload_event_replacement(self):
         with loaded_module() as module:
             plugin = object.__new__(module.JackettExtend)
@@ -268,7 +538,7 @@ class JackettV3ContractTest(unittest.TestCase):
             self.assertFalse(plugin._sync_is_current(generation=3))
             self.assertTrue(plugin._sync_is_current(generation=4))
 
-    def test_all_stale_selection_recomputes_empty_as_all_before_site_cleanup(self):
+    def test_all_stale_selection_stays_empty_and_does_not_cleanup_sites(self):
         with loaded_module() as module:
             plugin = object.__new__(module.JackettExtend)
             plugin._sync_stop_event = __import__("threading").Event()
@@ -286,11 +556,13 @@ class JackettV3ContractTest(unittest.TestCase):
             registered = []
             cleanup_snapshots = []
 
-            def status(generation=None):
+            def status(generation=None, config_snapshot=None):
                 return True
 
             def cleanup_selection(_snapshot, generation=None):
-                plugin._indexer_sites = []
+                # Keep the finite stale whitelist; cleanup must not turn it
+                # into the all-indexers meaning.
+                return True
 
             plugin.get_status = status
             plugin._JackettExtend__cleanup_stale_selection = cleanup_selection
@@ -304,8 +576,8 @@ class JackettV3ContractTest(unittest.TestCase):
 
             plugin._JackettExtend__sync_all(generation=2)
 
-            self.assertEqual(registered, ["nyaa", "animetosho"])
-            self.assertEqual(cleanup_snapshots, [["nyaa", "animetosho"]])
+            self.assertEqual(registered, [])
+            self.assertEqual(cleanup_snapshots, [])
 
 
 if __name__ == "__main__":

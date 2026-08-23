@@ -104,10 +104,17 @@ class TorznabEnclosureTest(unittest.TestCase):
 
     def test_log_url_redacts_credentials(self):
         redacted = MODULE.redact_url(
-            "http://jackett.invalid/results?apikey=secret&cat=3000&token=hidden"
+            "http://jackett.invalid/results?q=private%20title&apikey=secret&cat=3000&token=hidden&password=pw"
         )
+        self.assertNotIn("private", redacted)
+        self.assertNotIn("title", redacted)
         self.assertNotIn("secret", redacted)
         self.assertNotIn("hidden", redacted)
+        self.assertNotIn("pw", redacted)
+        self.assertIn("q=", redacted)
+        self.assertIn("apikey=", redacted)
+        self.assertIn("token=", redacted)
+        self.assertIn("password=", redacted)
         self.assertIn("cat=3000", redacted)
 
 

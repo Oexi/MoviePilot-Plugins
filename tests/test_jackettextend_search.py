@@ -27,8 +27,10 @@ class StringUtilsStub:
 
 
 class LoggerStub:
+    messages = []
+
     def __getattr__(self, _name):
-        return lambda *args, **kwargs: None
+        return lambda message, *args, **kwargs: self.messages.append(str(message))
 
 
 @contextmanager
@@ -93,6 +95,7 @@ def loaded_plugin_module():
 class JackettSearchKeywordTest(unittest.TestCase):
     def setUp(self):
         StringUtilsStub.clear_calls.clear()
+        LoggerStub.messages.clear()
 
     @staticmethod
     def run_search(module, keyword):
@@ -141,6 +144,48 @@ class JackettSearchKeywordTest(unittest.TestCase):
         query = parse_qs(urlparse(captured["url"]).query)
         self.assertEqual(query["q"], ["My Soul Your Beats Brave Song"])
         self.assertEqual(captured["keyword"], "My Soul Your Beats Brave Song")
+
+    def test_exact_profile_indexer_id_wins_over_decoded_domain(self):
+        with loaded_plugin_module() as module:
+            plugin = object.__new__(module.JackettExtend)
+            plugin._api_key = "test-key"
+            plugin._host = "http://jackett.invalid"
+            captured = {}
+
+            def parse_torznab(url, **kwargs):
+                captured["url"] = url
+                return []
+
+            setattr(plugin, "_JackettExtend__parse_torznab_xml", parse_torznab)
+            plugin.search_torrents(
+                site={
+                    "name": "Special",
+                    "domain": "jackett_extend.lowered%2Fdomain",
+                    "indexer_id": "Exact.ID/Path",
+                },
+                keyword="x",
+            )
+            self.assertIn("/indexers/Exact.ID%2FPath/results/", captured["url"])
+
+    def test_search_exception_log_never_contains_keyword_text(self):
+        with loaded_plugin_module() as module:
+            plugin = object.__new__(module.JackettExtend)
+            plugin._api_key = "test-key"
+            plugin._host = "http://jackett.invalid"
+
+            def parse_torznab(*_args, **_kwargs):
+                raise RuntimeError("request failed")
+
+            setattr(plugin, "_JackettExtend__parse_torznab_xml", parse_torznab)
+            plugin.search_torrents(
+                site={"name": "Nyaa", "domain": "jackett_extend.nyaa"},
+                keyword="PrivateSearchPhrase",
+            )
+
+            rendered = "\n".join(LoggerStub.messages)
+            self.assertNotIn("PrivateSearchPhrase", rendered)
+            self.assertNotIn("Private", rendered)
+            self.assertNotIn("SearchPhrase", rendered)
 
 
 if __name__ == "__main__":

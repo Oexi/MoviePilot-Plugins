@@ -3,12 +3,13 @@ import ast
 import asyncio
 import copy
 import functools
+import math
 import re
 import threading
 import time
 import xml.dom.minidom
 from typing import List, Dict, Any, Tuple, Optional
-from urllib.parse import urlencode, quote_plus, urlsplit
+from urllib.parse import urlencode, quote, quote_plus, unquote, urlsplit
 
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -74,7 +75,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.2.5"
+    plugin_version = "3.2.6"
     # 插件作者
     plugin_author = "jtcymc"
     # 作者主页
@@ -92,6 +93,8 @@ class JackettExtend(_PluginBase):
     SEARCH_TIMEOUT_DEFAULT = 30
     SEARCH_TIMEOUT_MIN = 5
     SEARCH_TIMEOUT_MAX = 120
+    TORZNAB_MAX_XML_BYTES = 8 * 1024 * 1024
+    TORZNAB_MAX_ITEMS = 5000
     # Existing rows are identified by the historical virtual-domain prefix;
     # newly injected profiles also carry explicit plugin/parser markers.
     _domain_prefixes = ("jackett_extend.",)
@@ -106,6 +109,8 @@ class JackettExtend(_PluginBase):
     _api_key = ""
     _password = ""
     _indexer_sites = ""
+    _indexer_sites_explicit = False
+    _config_snapshot = {}
     _indexers = []
     _authoritative_indexers = None
     _fetch_ok = False
@@ -123,8 +128,12 @@ class JackettExtend(_PluginBase):
     _indexers_cache_ts = 0.0
     _indexers_ttl = 600
     # H1: 保护 _indexers/_indexer_sites/_fetch_ok 共享状态的互斥锁
-    _state_lock = threading.Lock()
-    _sync_lock = threading.Lock()
+    _state_lock = threading.RLock()
+    # This lock protects the short, side-effecting commit phase only.  HTTP
+    # requests are deliberately performed before acquiring it.  RLock keeps
+    # config persistence (which is itself a commit) safe when called from a
+    # synchronization commit.
+    _sync_lock = threading.RLock()
     _sync_thread = None
     _sync_stop_event = None
     _sync_generation = 0
@@ -138,25 +147,40 @@ class JackettExtend(_PluginBase):
         # credentials and mutating the new instance's site state.
         self.stop_service()
 
-        # A1/A6: 初始化开始时复位共享状态，避免配置变更后沿用上一轮数据
-        with self._state_lock:
-            self._indexers = []
-            self._authoritative_indexers = None
-            self._fetch_ok = False
-            self._sync_ready = False
-            self._last_sync_ok = False
-            self._last_sync_at = 0.0
-            self._indexers_cache = None
-            self._indexers_cache_ts = 0.0
-            self._last_error = None
-            self._last_error_at = 0.0
+        # All replacement of configuration/state is serialized with the
+        # short commit phase.  An old worker may still be finishing a DB/event
+        # operation after stop_service() returns; waiting here ensures the
+        # new generation cannot be overwritten by that operation.
+        with self._sync_lock:
+            # A1/A6: initialize *every* configuration field, including
+            # credentials, before applying a possibly empty config.  This is
+            # important for init_plugin(None/{}) reloads.
+            with self._state_lock:
+                self._host = ""
+                self._api_key = ""
+                self._password = ""
+                self._enabled = False
+                self._proxy = False
+                self._cron = "0 0 * * *"
+                self._timeout = self.SEARCH_TIMEOUT_DEFAULT
+                self._indexer_sites = []
+                self._indexer_sites_explicit = False
+                self._indexers = []
+                self._authoritative_indexers = None
+                self._fetch_ok = False
+                self._sync_ready = False
+                self._last_sync_ok = False
+                self._last_sync_at = 0.0
+                self._indexers_cache = None
+                self._indexers_cache_ts = 0.0
+                self._last_error = None
+                self._last_error_at = 0.0
 
-        # A fresh generation makes old scheduler callbacks harmless even if a
-        # host cannot cancel a callback that is already queued.
-        with self._state_lock:
-            self._sync_generation += 1
-            generation = self._sync_generation
-        self._sync_stop_event = threading.Event()
+                # A fresh generation makes old scheduler callbacks harmless
+                # even if a host cannot cancel a callback already queued.
+                self._sync_generation += 1
+                generation = self._sync_generation
+                self._sync_stop_event = threading.Event()
 
         if SitesHelper is not None:
             try:
@@ -167,33 +191,46 @@ class JackettExtend(_PluginBase):
         else:
             self.sites_helper = None
 
-        # 读取配置
-        if config:
-            # A7: host 去除首尾空白，协议判断大小写不敏感，None 统一兜底为空串
-            host = config.get("host")
-            if host:
-                host = str(host).strip()
-                if not host.lower().startswith(("http://", "https://")):
-                    host = "http://" + host
-                host = host.rstrip("/")
-            self._host = host or ""
-            self._api_key = (config.get("api_key") or "").strip()
-            self._password = config.get("password") or ""
-            self._enabled = bool(config.get("enabled"))
-            self._proxy = bool(config.get("proxy"))
-            self._timeout = self._normalize_timeout(
-                config.get("timeout", config.get("search_timeout"))
-            )
-            raw_sites = config.get("indexer_sites") or ""
-            if isinstance(raw_sites, list):
-                # UI 多选(VSelect multiple)保存为数组
-                self._indexer_sites = [str(x).strip() for x in raw_sites if str(x).strip()]
-            else:
-                # API/旧配置为逗号分隔字符串
-                self._indexer_sites = [x.strip() for x in str(raw_sites).split(",") if x.strip()]
-            self._cron = str(config.get("cron") or "").strip() or "0 0 * * *"
-        else:
-            self._timeout = self.SEARCH_TIMEOUT_DEFAULT
+        # 读取配置.  Keep assignment under the state lock so a concurrent
+        # search/form request cannot observe a partially applied replacement.
+        with self._state_lock:
+            if isinstance(config, dict) and config:
+                # A7: host 去除首尾空白，协议判断大小写不敏感，None 统一兜底为空串
+                host = config.get("host")
+                if host:
+                    host = str(host).strip()
+                    if not host.lower().startswith(("http://", "https://")):
+                        host = "http://" + host
+                    host = host.rstrip("/")
+                self._host = host or ""
+                self._api_key = str(config.get("api_key") or "").strip()
+                self._password = str(config.get("password") or "")
+                self._enabled = bool(config.get("enabled"))
+                self._proxy = bool(config.get("proxy"))
+                self._timeout = self._normalize_timeout(
+                    config.get("timeout", config.get("search_timeout"))
+                )
+                raw_sites = config.get("indexer_sites") or ""
+                if isinstance(raw_sites, list):
+                    # UI 多选(VSelect multiple)保存为数组
+                    self._indexer_sites = [str(x).strip() for x in raw_sites if str(x).strip()]
+                else:
+                    # API/旧配置为逗号分隔字符串
+                    self._indexer_sites = [x.strip() for x in str(raw_sites).split(",") if x.strip()]
+                # Keep the distinction between an intentionally finite whitelist
+                # and an empty value (which means all indexers).  This flag stays
+                # true if cleanup removes only stale entries, preventing a
+                # transient all-stale list from becoming an implicit all-sites
+                # selection.
+                canonical_sites = self._parse_indexer_sites()
+                self._indexer_sites = canonical_sites
+                self._indexer_sites_explicit = bool(canonical_sites)
+                self._cron = str(config.get("cron") or "").strip() or "0 0 * * *"
+            # Immutable credentials/network settings are published in the
+            # same critical section as the fields above.  A worker keeps its
+            # local copy even if a reload replaces the instance attributes
+            # while its request is in flight.
+            self._config_snapshot = self._capture_config_snapshot_locked()
         if not self._enabled:
             return
 
@@ -238,10 +275,36 @@ class JackettExtend(_PluginBase):
         if isinstance(value, bool):
             return cls.SEARCH_TIMEOUT_DEFAULT
         try:
-            timeout = int(float(value))
-        except (TypeError, ValueError):
+            numeric = float(value)
+            if not math.isfinite(numeric):
+                return cls.SEARCH_TIMEOUT_DEFAULT
+            timeout = int(numeric)
+        except (TypeError, ValueError, OverflowError):
             return cls.SEARCH_TIMEOUT_DEFAULT
         return max(cls.SEARCH_TIMEOUT_MIN, min(cls.SEARCH_TIMEOUT_MAX, timeout))
+
+    def _capture_config_snapshot_locked(self) -> dict:
+        """Capture only immutable network settings used by a sync request.
+
+        The caller must hold ``_state_lock``.  Keeping this deliberately small
+        prevents a stale worker from reading a newly reloaded credential or
+        timeout halfway through its request sequence.
+        """
+        return {
+            "host": str(getattr(self, "_host", "") or ""),
+            "api_key": str(getattr(self, "_api_key", "") or ""),
+            "password": str(getattr(self, "_password", "") or ""),
+            "proxy": bool(getattr(self, "_proxy", False)),
+            "timeout": self._normalize_timeout(getattr(self, "_timeout", self.SEARCH_TIMEOUT_DEFAULT)),
+        }
+
+    def _config_for_sync(self) -> dict:
+        """Return a copy of the current immutable sync configuration."""
+        with self._state_lock:
+            snapshot = getattr(self, "_config_snapshot", None)
+            if isinstance(snapshot, dict) and snapshot:
+                return dict(snapshot)
+            return self._capture_config_snapshot_locked()
 
     @classmethod
     def _domain_prefix_set(cls):
@@ -251,10 +314,13 @@ class JackettExtend(_PluginBase):
     @classmethod
     def _indexer_id_from_domain(cls, domain: object) -> str:
         """Extract an indexer id from a persisted virtual domain."""
-        value = str(domain or "").strip().lower()
+        value = str(domain or "").strip()
         for prefix in cls._domain_prefix_set():
-            if value.startswith(prefix):
-                return value[len(prefix):]
+            if value.lower().startswith(prefix):
+                # Domains are synthetic and may contain percent-encoded
+                # special Jackett IDs.  Decode only the suffix; dots remain
+                # intact and therefore continue to identify the same ID.
+                return unquote(value[len(prefix):])
         return ""
 
     @classmethod
@@ -283,15 +349,19 @@ class JackettExtend(_PluginBase):
             and (generation is None or generation == current)
         )
 
-    def _record_error(self, category: str):
+    def _record_error(self, category: str, generation: Optional[int] = None):
         """Remember only a bounded, non-sensitive diagnostic category."""
         safe = re.sub(r"[^a-z0-9_.-]", "_", str(category or "error").lower())[:64]
         with self._state_lock:
+            if generation is not None and not self._sync_is_current(generation):
+                return
             self._last_error = safe or "error"
             self._last_error_at = time.time()
 
-    def _clear_error(self):
+    def _clear_error(self, generation: Optional[int] = None):
         with self._state_lock:
+            if generation is not None and not self._sync_is_current(generation):
+                return
             self._last_error = None
             self._last_error_at = 0.0
 
@@ -302,15 +372,19 @@ class JackettExtend(_PluginBase):
         """
         try:
             if not self._sync_is_current(generation):
-                return
+                return False
             # A1: empty/failed/cached snapshots never authorize destructive
             # cleanup.  ``_sync_ready`` is set only by a fresh non-empty fetch.
             with self._state_lock:
                 sync_ready = self._sync_ready
                 if indexers_snapshot is None:
                     indexers_snapshot = list(self._indexers) if isinstance(self._indexers, list) else []
-            if not sync_ready or not isinstance(indexers_snapshot, list):
-                return
+            # An empty selected set is not proof that every previously
+            # registered virtual site is stale (it may be a finite whitelist
+            # with no currently available IDs).  Never delete the whole set
+            # on that single observation.
+            if not sync_ready or not isinstance(indexers_snapshot, list) or not indexers_snapshot:
+                return True
             try:
                 from app.db.site_oper import SiteOper
             except ImportError:
@@ -321,12 +395,16 @@ class JackettExtend(_PluginBase):
             except ImportError:
                 eventmanager = None
                 EventType = None
-            current_domains = {str(i.get("domain", "")).lower()
-                               for i in indexers_snapshot if i.get("domain")}
+            current_domains = {
+                str(i.get("domain", "")).lower()
+                for i in indexers_snapshot
+                if isinstance(i, dict) and i.get("domain")
+            }
             site_oper = SiteOper()
+            stage_ok = True
             for site in site_oper.list():
                 if not self._sync_is_current(generation):
-                    return
+                    return False
                 site_domain = str(getattr(site, "domain", "") or "").strip().lower()
                 if (self._indexer_id_from_domain(site_domain)
                         and site_domain not in current_domains):
@@ -337,55 +415,67 @@ class JackettExtend(_PluginBase):
                         try:
                             eventmanager.send_event(EventType.SiteDeleted, {"site_id": site.id})
                         except Exception as e:
+                            stage_ok = False
                             logger.warning(f"【{self.plugin_name}】发送 SiteDeleted 事件失败：{type(e).__name__}：{str(e)}")
+            return stage_ok
         except Exception as e:
             logger.error(f"【{self.plugin_name}】清理过期站点失败: {str(e)}")
+            return False
 
-    def get_status(self, generation: Optional[int] = None):
+    def get_status(self, generation: Optional[int] = None,
+                   config_snapshot: Optional[dict] = None):
         """
         检查连通性
         :return: True、False
         """
         if generation is not None and not self._sync_is_current(generation):
             return False
-        if not self._api_key or not self._host:
+        snapshot = dict(config_snapshot or self._config_for_sync())
+        if not snapshot.get("api_key") or not snapshot.get("host"):
             with self._state_lock:
+                if generation is not None and not self._sync_is_current(generation):
+                    return False
                 self._indexers = []
                 self._authoritative_indexers = None
                 self._fetch_ok = False
                 self._sync_ready = False
                 self._last_sync_ok = False
-            self._record_error("missing_config")
+            self._record_error("missing_config", generation=generation)
             return False
         try:
             # The sync decision must be based on the complete, fresh Jackett
             # list, not on a whitelist-filtered cache.
-            indexers = self.get_indexers(filter_selected=False, force_refresh=True)
+            indexers = self.get_indexers(
+                filter_selected=False,
+                force_refresh=True,
+                config_snapshot=snapshot,
+                generation=generation,
+            )
         except Exception as e:
-            self._record_error("status_error")
+            self._record_error("status_error", generation=generation)
             logger.error(f"【{self.plugin_name}】检查 Jackett 连通性失败：{type(e).__name__}")
             indexers = None
         if generation is not None and not self._sync_is_current(generation):
             return False
         # A1: distinguish failed(None), successful-empty([]), and fresh
         # non-empty snapshots.  Only the latter can authorize cleanup.
-        selected = []
-        if isinstance(indexers, list) and indexers:
-            selected_ids = self._parse_indexer_sites()
-            selected = (
-                [i for i in indexers
-                 if str(i.get("indexer_id") or "").strip().lower() in selected_ids]
-                if selected_ids else list(indexers)
-            )
+        selected = self._apply_indexer_selection(indexers)
         with self._state_lock:
-            self._authoritative_indexers = indexers
-            self._indexers = selected
+            if generation is not None and not self._sync_is_current(generation):
+                return False
+            # Commit deep copies so callers cannot mutate the authoritative
+            # snapshot/cache while a synchronization stage is using it.
+            self._authoritative_indexers = copy.deepcopy(indexers)
+            self._indexers = copy.deepcopy(selected)
             self._fetch_ok = indexers is not None
             self._sync_ready = bool(indexers)
             self._last_sync_at = time.time()
-            self._last_sync_ok = bool(indexers)
+            # A successful fetch is only the first stage.  __sync_all keeps
+            # this false until cleanup, SitesHelper, DB registration, and
+            # event publication all complete successfully.
+            self._last_sync_ok = False
         if isinstance(indexers, list) and indexers:
-            self._clear_error()
+            self._clear_error(generation=generation)
         return isinstance(indexers, list) and len(indexers) > 0
 
     def __sync_all(self, generation: Optional[int] = None):
@@ -393,43 +483,63 @@ class JackettExtend(_PluginBase):
         完整同步：拉取索引器列表 → 清理失效勾选 → 注册/注入 → 清理过期站点。
         定时任务与初始化共用，确保 Jackett 变更(新增/移除/白名单)自动同步到 MP。
         """
-        # Scheduler max_instances=1 handles normal overlap.  The lock also
-        # covers reload/manual calls.  An initial background worker waits for
-        # an older generation to release the shared lock so a reload cannot
-        # silently miss its first synchronization; ad-hoc calls remain
-        # non-blocking.
-        if not self._sync_lock.acquire(blocking=generation is not None):
+        if generation is not None and not self._sync_is_current(generation):
             return
+        # Capture immutable credentials before any network call.  The commit
+        # lock is intentionally not held during get_status()/HTTP requests.
+        with self._state_lock:
+            config_snapshot = dict(getattr(self, "_config_snapshot", {}) or {})
+            if not config_snapshot:
+                config_snapshot = self._capture_config_snapshot_locked()
+        try:
+            status_ok = self.get_status(generation=generation, config_snapshot=config_snapshot)
+        except TypeError as exc:
+            # Keep compatibility with host/test shims that override the
+            # historical one-argument get_status hook.
+            if "config_snapshot" not in str(exc):
+                raise
+            status_ok = self.get_status(generation=generation)
+        if not status_ok:
+            with self._state_lock:
+                if generation is None or self._sync_is_current(generation):
+                    self._last_sync_ok = False
+            return
+
+        # Only the short state/DB/event phase is serialized.  A reload waits
+        # for this lock before replacing configuration, while stale workers
+        # are rejected by the generation check at every side-effect boundary.
+        self._sync_lock.acquire()
         try:
             if not self._sync_is_current(generation):
                 return
-            self.get_status(generation=generation)
             with self._state_lock:
                 fetch_ok = self._fetch_ok
                 sync_ready = self._sync_ready
-                indexers_snapshot = list(self._indexers) if isinstance(self._indexers, list) else None
-                authoritative = (list(self._authoritative_indexers)
+                indexers_snapshot = copy.deepcopy(self._indexers) if isinstance(self._indexers, list) else None
+                authoritative = (copy.deepcopy(self._authoritative_indexers)
                                  if isinstance(self._authoritative_indexers, list) else None)
             if not fetch_ok or not sync_ready or not isinstance(authoritative, list) or not authoritative:
                 # A1: failed/empty results never clear selections or sites.
                 logger.debug(f"【{self.plugin_name}】索引器快照不可用于清理，跳过同步清理")
                 return
-            self.__cleanup_stale_selection(authoritative, generation=generation)
+            stage_ok = True
+            if self.__cleanup_stale_selection(authoritative, generation=generation) is False:
+                stage_ok = False
             # Cleanup can turn an all-stale whitelist into the documented
-            # empty-selection meaning (all indexers).  Recompute the desired
-            # set before registration/removal so that transition cannot
-            # accidentally delete every virtual site for one sync cycle.
-            selected_ids = self._parse_indexer_sites()
-            indexers_snapshot = (
-                [i for i in authoritative
-                 if str(i.get("indexer_id") or "").strip().lower() in selected_ids]
-                if selected_ids else list(authoritative)
-            )
+            # empty-selection meaning (all indexers) only when the user did
+            # not configure a finite whitelist.  A finite all-stale list must
+            # remain empty and cannot authorize registering every site.
+            indexers_snapshot = self._apply_indexer_selection(authoritative)
             with self._state_lock:
-                self._indexers = list(indexers_snapshot)
+                if not self._sync_is_current(generation):
+                    return
+                self._indexers = copy.deepcopy(indexers_snapshot)
             for indexer in indexers_snapshot or []:
                 if not self._sync_is_current(generation):
                     return
+                if not isinstance(indexer, dict):
+                    stage_ok = False
+                    continue
                 domain = indexer.get("domain", "")
                 if not domain:
                     continue
@@ -438,15 +548,23 @@ class JackettExtend(_PluginBase):
                     if self.sites_helper is not None and hasattr(self.sites_helper, "add_indexer"):
                         self.sites_helper.add_indexer(domain, new_indexer)
                     else:
+                        stage_ok = False
                         logger.debug(f"【{self.plugin_name}】宿主 SitesHelper 无 add_indexer，跳过内存注入: {domain}")
                 except Exception as e:
+                    stage_ok = False
                     logger.error(f"【{self.plugin_name}】注入站点 {domain} 失败: {type(e).__name__}")
                 if not self._sync_is_current(generation):
                     return
-                self.__register_site(indexer, generation=generation)
-            self.__sync_remove_stale_sites(indexers_snapshot or [], generation=generation)
+                if self.__register_site(indexer, generation=generation) is False:
+                    stage_ok = False
+            # An empty selected set (for example a finite all-stale
+            # whitelist) must not invoke destructive site cleanup at all.
+            if indexers_snapshot:
+                if self.__sync_remove_stale_sites(indexers_snapshot, generation=generation) is False:
+                    stage_ok = False
             with self._state_lock:
-                self._last_sync_ok = True
+                if self._sync_is_current(generation):
+                    self._last_sync_ok = stage_ok
         finally:
             self._sync_lock.release()
 
@@ -479,22 +597,35 @@ class JackettExtend(_PluginBase):
         except Exception as e:
             logger.error(f"【{self.plugin_name}】停止插件错误: {str(e)}")
 
-    def __update_config(self):
+    def __update_config(self, generation: Optional[int] = None):
         """
         更新插件配置
         """
         # V3 适配：宿主 update_config() 为整体替换，必须写回全部配置项，
         # 否则 enabled/proxy 丢失导致插件重载后静默失效
-        self.update_config({
-            "cron": self._cron,
-            "host": self._host,
-            "api_key": self._api_key,
-            "password": self._password,
-            "indexer_sites": self._indexer_sites,
-            "enabled": self._enabled,
-            "proxy": self._proxy,
-            "timeout": self._timeout,
-        })
+        # update_config is a host-side side effect.  Serialize it with DB and
+        # event commits and re-check generation while holding the commit lock
+        # so a stale worker cannot write a freshly reloaded config.
+        with self._sync_lock:
+            if not self._sync_is_current(generation):
+                return False
+            with self._state_lock:
+                payload = {
+                    "cron": self._cron,
+                    "host": self._host,
+                    "api_key": self._api_key,
+                    "password": self._password,
+                    "indexer_sites": copy.deepcopy(self._indexer_sites),
+                    "enabled": self._enabled,
+                    "proxy": self._proxy,
+                    "timeout": self._timeout,
+                }
+            try:
+                self.update_config(payload)
+                return True
+            except Exception as e:
+                logger.error(f"【{self.plugin_name}】保存配置失败：{type(e).__name__}")
+                return False
 
     def __register_site(self, indexer: dict, generation: Optional[int] = None):
         """
@@ -502,10 +633,10 @@ class JackettExtend(_PluginBase):
         搜索链从 DB 读取有效站点，仅 add_indexer 注入内存时站点不可见。
         """
         if not self._sync_is_current(generation):
-            return
+            return False
         domain = indexer.get("domain", "")
         if not domain:
-            return
+            return False
         try:
             # 双架构兼容：V2/V3 镜像旧路径由宿主 compat 层路由到规范路径
             try:
@@ -526,7 +657,7 @@ class JackettExtend(_PluginBase):
             url = f"https://{domain}/"
             public = 1 if indexer.get("public") else 0
             if not self._sync_is_current(generation):
-                return
+                return False
             if exists:
                 # B1: 更新分支只同步 name/url/public 来源字段,
                 # 保留 is_active/pri/proxy 等用户站点设置不被 cron 覆盖
@@ -559,8 +690,11 @@ class JackettExtend(_PluginBase):
                     eventmanager.send_event(EventType.SiteUpdated, {"domain": domain})
                 except Exception as e:
                     logger.warning(f"【{self.plugin_name}】发送 SiteUpdated 事件失败：{type(e).__name__}：{str(e)}")
+                    return False
+            return True
         except Exception as e:
             logger.error(f"【{self.plugin_name}】注册站点 {domain} 到 DB 失败: {str(e)}")
+            return False
 
     def _parse_indexer_sites(self) -> list:
         """
@@ -573,37 +707,40 @@ class JackettExtend(_PluginBase):
             return []
 
         cleaned = []
-        if isinstance(sites, list):
-            # 宿主可能把字符串化的 list 二次解析为带引号/括号的碎片元素，
-            # 如 ["['thepiratebay'", "'therarbg']"]，逐个剥引号清洗
-            for x in sites:
-                x = str(x).strip()
-                if not x:
-                    continue
-                # C1: 取全部引号 token(原实现只保留最后一个,勾选被静默截断)
-                m = re.findall(r"[\'\"]([^\'\"]+)[\'\"]", x)
-                if m:
-                    cleaned.extend(t.strip() for t in m if t.strip())
-                else:
-                    # C1: 无引号元素再按逗号 split,兼容 "a, b" 作为单个 list 元素
-                    cleaned.extend(t.strip() for t in x.strip("[]'\" ").split(",") if t.strip())
-        elif isinstance(sites, str):
-            s = sites.strip()
-            # 方法1：字符串化的 list，如 "['thepiratebay', 'therarbg']"
-            if s.startswith("[") and s.endswith("]"):
+
+        def append_value(value, depth=0):
+            """Flatten ordinary/serialized/nested list forms into IDs."""
+            if depth > 5 or value is None:
+                return
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    append_value(item, depth + 1)
+                return
+            text = str(value).strip()
+            if not text:
+                return
+            # Parse a serialized list at every nesting level (including a
+            # second stringification such as "['[\"a\", \"b\"]']").
+            if text.startswith("[") and text.endswith("]"):
                 try:
-                    parsed = ast.literal_eval(s)
-                    if isinstance(parsed, list):
-                        cleaned.extend(str(x).strip() for x in parsed if str(x).strip())
+                    parsed = ast.literal_eval(text)
                 except Exception:
-                    pass
-            if not cleaned:
-                # 方法2：正则提取引号包裹的 id（兼容任何引号类型/额外字符）
-                quoted = re.findall(r"[\'\"]([^\'\"]+)[\'\"]", s)
-                if quoted:
-                    cleaned.extend(x.strip() for x in quoted if x.strip())
-                else:
-                    cleaned.extend(x.strip() for x in s.split(",") if x.strip())
+                    parsed = None
+                if isinstance(parsed, (list, tuple)):
+                    append_value(parsed, depth + 1)
+                    return
+            quoted = re.findall(r"[\'\"]([^\'\"]+)[\'\"]", text)
+            if quoted:
+                for item in quoted:
+                    append_value(item, depth + 1)
+                return
+            # A list element may itself be a comma-delimited string.
+            for item in text.strip("[]'\" ").split(","):
+                item = item.strip()
+                if item:
+                    cleaned.append(item)
+
+        append_value(sites)
 
         # 最后统一 strip/lower/去空去重
         result = []
@@ -615,6 +752,30 @@ class JackettExtend(_PluginBase):
                 result.append(x)
         return result
 
+    def _selection_is_explicit(self) -> bool:
+        """Whether an empty parsed selection still represents a finite list."""
+        with self._state_lock:
+            explicit = getattr(self, "_indexer_sites_explicit", None)
+            raw = getattr(self, "_indexer_sites", None)
+        if explicit:
+            return True
+        # Object-level test fixtures and legacy instances may not carry the
+        # flag; a non-empty raw value still unambiguously means finite.
+        return bool(self._parse_indexer_sites()) or bool(raw)
+
+    def _apply_indexer_selection(self, indexers: object) -> list:
+        """Apply the canonical whitelist without turning stale-all into all."""
+        if not isinstance(indexers, list):
+            return []
+        selected_ids = self._parse_indexer_sites()
+        if not selected_ids:
+            return [] if self._selection_is_explicit() else copy.deepcopy(indexers)
+        return [
+            copy.deepcopy(i) for i in indexers
+            if isinstance(i, dict)
+            and str(i.get("indexer_id") or "").strip().lower() in selected_ids
+        ]
+
     def __cleanup_stale_selection(self, authoritative_indexers: Optional[list] = None,
                                   generation: Optional[int] = None):
         """
@@ -623,7 +784,7 @@ class JackettExtend(_PluginBase):
         """
         try:
             if not self._sync_is_current(generation):
-                return
+                return False
             with self._state_lock:
                 sites_snapshot = list(self._indexer_sites) if isinstance(self._indexer_sites, list) else []
                 indexers_snapshot = (
@@ -633,28 +794,39 @@ class JackettExtend(_PluginBase):
                           if isinstance(self._authoritative_indexers, list) else [])
                 )
             if not sites_snapshot:
-                return
+                return True
             # A1: only a fresh, non-empty authoritative snapshot is allowed
             # to rewrite the user's selection.
             with self._state_lock:
                 sync_ready = self._sync_ready
             if not sync_ready or not indexers_snapshot:
-                return
+                return True
             # C2: 以 indexer_id 为单一事实来源,合成名仅用于显示
             valid = {str(i.get("indexer_id") or "").strip().lower()
                      for i in indexers_snapshot if i.get("indexer_id")}
             stale = [x for x in sites_snapshot if str(x).strip().lower() not in valid]
             if stale:
                 if not self._sync_is_current(generation):
-                    return
+                    return False
+                retained = [
+                    x for x in sites_snapshot
+                    if str(x).strip().lower() in valid
+                ]
+                # Never erase the complete finite whitelist.  Keeping stale
+                # IDs is safer than persisting [] and silently registering all
+                # indexers on the next sync/reload.
+                if not retained:
+                    logger.warning(f"【{self.plugin_name}】白名单全部失效，保留原配置并跳过全量注册")
+                    return True
                 with self._state_lock:
-                    self._indexer_sites = [
-                        x for x in self._indexer_sites if str(x).strip().lower() in valid
-                    ]
-                self.__update_config()
+                    self._indexer_sites = retained
+                if self.__update_config(generation=generation) is False:
+                    return False
                 logger.info(f"【{self.plugin_name}】已清理失效勾选: {stale}")
+            return True
         except Exception as e:
             logger.error(f"【{self.plugin_name}】清理失效勾选失败: {str(e)}")
+            return False
 
     def search_torrents(self, site: dict, keyword: str = None, mtype: Optional[MediaType] = None,
                         cat: Optional[str] = None, page: Optional[int] = 0, **kwargs) -> \
@@ -689,10 +861,12 @@ class JackettExtend(_PluginBase):
             # 非本插件站点属正常分发，DEBUG 即可，避免百站搜索刷屏
             logger.debug(f"【{self.plugin_name}】站点非本插件注册，交由其他模块处理：name={site.get('name')}, domain={domain!r}")
             return results
-        # D1: indexer id 取 domain 第一个点之后的全部内容，兼容带点的 id
-        indexer_id = self._indexer_id_from_domain(domain)
+        # Prefer the exact ID carried by the profile.  A persisted hostname
+        # can be lower-cased or percent-decoded by the host, so use domain
+        # decoding only as a fallback for legacy rows.
+        indexer_id = str(site.get("indexer_id") or "").strip()
         if not indexer_id:
-            indexer_id = str(site.get("indexer_id") or "").strip()
+            indexer_id = self._indexer_id_from_domain(domain)
         if not indexer_id:
             # D1: 前缀命中但无法解析 id 才是真正的识别失败，用 WARNING 便于诊断
             logger.warning(f"【{self.plugin_name}】站点识别失败，无法从 domain 解析 indexer id：name={site.get('name')}, domain={domain!r}")
@@ -712,12 +886,19 @@ class JackettExtend(_PluginBase):
         keyword = StringUtils.clear(text=keyword, replace_word=" ", allow_space=True)
         masked_keyword = self.__mask_keyword(keyword)
         api_url = ""
+        config_snapshot = self._config_for_sync()
+        # The snapshot is authoritative even when a reload has already
+        # replaced instance attributes.  Falling back with ``or`` here would
+        # leak the new generation's host/key into an in-flight search when the
+        # old snapshot intentionally contains an empty value.
+        host = str(config_snapshot.get("host", "") or "").rstrip("/")
+        api_key = str(config_snapshot.get("api_key", "") or "")
         try:
             # D6: 搜索热路径日志降为 DEBUG,关键词仅 DEBUG 输出且脱敏
             logger.debug(f"【{self.plugin_name}】开始检索 Indexer：\"{site.get('name')}\"，关键词：\"{masked_keyword}\"")
 
             params = {
-                "apikey": self._api_key,
+                "apikey": api_key,
                 "t": "search",
                 "q": keyword,
             }
@@ -744,9 +925,13 @@ class JackettExtend(_PluginBase):
                     logger.debug(
                         f"【{self.plugin_name}】忽略非分类 ID 格式的 cat 参数：{cat_value!r}")
             query_string = urlencode(params, quote_via=quote_plus)
-            api_url = f"{self._host.rstrip('/')}/api/v2.0/indexers/{indexer_id}/results/torznab/?{query_string}"
+            encoded_indexer_id = quote(str(indexer_id), safe=".-_~")
+            api_url = f"{host}/api/v2.0/indexers/{encoded_indexer_id}/results/torznab/?{query_string}"
 
-            result_array = self.__parse_torznab_xml(api_url, site=site, mtype=mtype, keyword=keyword)
+            result_array = self.__parse_torznab_xml(
+                api_url, site=site, mtype=mtype, keyword=keyword,
+                config_snapshot=config_snapshot,
+            )
 
             if not result_array:
                 # D6: 无结果是常态,降为 DEBUG
@@ -794,7 +979,9 @@ class JackettExtend(_PluginBase):
             **kwargs,
         )
 
-    def get_indexers(self, filter_selected: bool = True, force_refresh: bool = False):
+    def get_indexers(self, filter_selected: bool = True, force_refresh: bool = False,
+                     config_snapshot: Optional[dict] = None,
+                     generation: Optional[int] = None):
         """
         获取配置的 Jackett Indexer 信息
         :param filter_selected: True 按白名单过滤(留空=全部),False 返回完整列表
@@ -809,23 +996,27 @@ class JackettExtend(_PluginBase):
         if force_refresh:
             # 初始化/cron 同步强制刷新;失败返回 None,不复用旧缓存,
             # 避免把旧数据误判为"本次拉取成功"而触发破坏性清理(A1)
-            raw = self.__fetch_indexers()
+            raw = self.__fetch_indexers(config_snapshot=config_snapshot, generation=generation)
             if raw is None:
                 return None
-            with self._state_lock:
-                self._indexers_cache = raw
-                self._indexers_cache_ts = time.time()
+            if generation is None or self._sync_is_current(generation):
+                with self._state_lock:
+                    if generation is None or self._sync_is_current(generation):
+                        self._indexers_cache = copy.deepcopy(raw)
+                        self._indexers_cache_ts = time.time()
         elif isinstance(cached, list) and cached_ts and (now - cached_ts) < self._indexers_ttl:
             # E1: TTL 内直接使用缓存
             raw = cached
         else:
             # E1/G4: 表单/详情页缓存过期或缺失时尝试刷新;失败用旧缓存兜底,
             # 并顺延时间戳,避免 Jackett 故障时每次打开页面都阻塞在超时请求上
-            raw = self.__fetch_indexers()
+            raw = self.__fetch_indexers(config_snapshot=config_snapshot, generation=generation)
             if raw is not None:
-                with self._state_lock:
-                    self._indexers_cache = raw
-                    self._indexers_cache_ts = time.time()
+                if generation is None or self._sync_is_current(generation):
+                    with self._state_lock:
+                        if generation is None or self._sync_is_current(generation):
+                            self._indexers_cache = copy.deepcopy(raw)
+                            self._indexers_cache_ts = time.time()
             elif isinstance(cached, list):
                 raw = cached
                 with self._state_lock:
@@ -834,25 +1025,28 @@ class JackettExtend(_PluginBase):
                 return None
 
         if not filter_selected:
-            return list(raw)
-        selected = self._parse_indexer_sites()
-        if not selected:
-            return list(raw)
-        # C2: 白名单过滤统一以 indexer_id 为单一事实来源,合成名仅用于显示
-        return [i for i in raw if str(i.get("indexer_id") or "").strip().lower() in selected]
+            return copy.deepcopy(raw)
+        return self._apply_indexer_selection(raw)
 
-    def __fetch_indexers(self):
+    def __fetch_indexers(self, config_snapshot: Optional[dict] = None,
+                         generation: Optional[int] = None):
         """
         实时从 Jackett 拉取并构造 indexer 列表（完整列表,不过滤白名单）。
         :return: 成功返回 list(可能为空);失败返回 None
         """
-        if not self._host or not self._api_key:
-            self._record_error("missing_config")
+        snapshot = dict(config_snapshot or self._config_for_sync())
+        host = str(snapshot.get("host") or "").rstrip("/")
+        api_key = str(snapshot.get("api_key") or "")
+        password = str(snapshot.get("password") or "")
+        proxy = bool(snapshot.get("proxy"))
+        timeout = self._normalize_timeout(snapshot.get("timeout"))
+        if not host or not api_key:
+            self._record_error("missing_config", generation=generation)
             return None
         headers = {
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
             "User-Agent": settings.USER_AGENT,
-            "X-Api-Key": self._api_key,
+            "X-Api-Key": api_key,
             "Accept": "application/json, text/javascript, */*; q=0.01"
         }
 
@@ -860,57 +1054,57 @@ class JackettExtend(_PluginBase):
         session = requests.session()
         try:
             # E2: 密码为空时跳过登录;仅通过 data 提交密码,不放入 URL query string
-            if self._password:
-                login_url = f"{self._host.rstrip('/')}/UI/Dashboard"
+            if password:
+                login_url = f"{host}/UI/Dashboard"
                 try:
-                    login_res = RequestUtils(headers=headers, session=session).post_res(
+                    login_res = RequestUtils(headers=headers, session=session, timeout=timeout).post_res(
                         url=login_url,
-                        data={"password": self._password},
-                        proxies=settings.PROXY if self._proxy else None
+                        data={"password": password},
+                        proxies=settings.PROXY if proxy else None
                     )
                 except Exception as e:
-                    self._record_error("login_error")
+                    self._record_error("login_error", generation=generation)
                     logger.warning(f"【{self.plugin_name}】Jackett 登录请求异常：{type(e).__name__}")
                     login_res = None
                 if login_res is not None and session.cookies:
                     cookie = session.cookies.get_dict()
-                elif self._password:
+                elif password:
                     logger.warning(f"【{self.plugin_name}】Jackett 登录失败，无法获取 cookie")
 
-            indexer_query_url = f"{self._host.rstrip('/')}/api/v2.0/indexers?configured=true"
-            ret = RequestUtils(headers=headers, cookies=cookie).get_res(
+            indexer_query_url = f"{host}/api/v2.0/indexers?configured=true"
+            ret = RequestUtils(headers=headers, cookies=cookie, timeout=timeout).get_res(
                 indexer_query_url,
-                proxies=settings.PROXY if self._proxy else None
+                proxies=settings.PROXY if proxy else None
             )
 
             # E3: 校验状态码/Content-Type/数据类型,json 只解析一次
             if ret is None:
-                self._record_error("empty")
+                self._record_error("empty", generation=generation)
                 logger.warning(f"【{self.plugin_name}】拉取 indexers 请求失败：{redact_url(indexer_query_url)}")
                 return None
             if ret.status_code != 200:
-                self._record_error(f"http_{ret.status_code}")
+                self._record_error(f"http_{ret.status_code}", generation=generation)
                 logger.warning(f"【{self.plugin_name}】拉取 indexers 失败,HTTP {ret.status_code}：{redact_url(indexer_query_url)}")
                 return None
             content_type = (ret.headers.get("Content-Type") or "").lower()
             if "json" not in content_type:
-                self._record_error("content_type")
+                self._record_error("content_type", generation=generation)
                 logger.warning(f"【{self.plugin_name}】拉取 indexers 响应非 JSON(Content-Type={content_type!r})")
                 return None
             try:
                 raw_indexers = ret.json()
             except ValueError as e:
-                self._record_error("json_error")
+                self._record_error("json_error", generation=generation)
                 logger.warning(f"【{self.plugin_name}】拉取 indexers JSON 解析失败：{type(e).__name__}")
                 return None
             if not isinstance(raw_indexers, list):
-                self._record_error("json_type")
+                self._record_error("json_type", generation=generation)
                 logger.warning(
                     f"【{self.plugin_name}】拉取 indexers 响应类型异常"
                     f"(期望 list,实际 {type(raw_indexers).__name__})")
                 return None
         except Exception as e:
-            self._record_error("request_error")
+            self._record_error("request_error", generation=generation)
             logger.error(f"【{self.plugin_name}】获取 Jackett indexers 失败：{type(e).__name__}")
             return None
         finally:
@@ -920,11 +1114,12 @@ class JackettExtend(_PluginBase):
             except Exception:
                 pass
 
+        # Jackett normally returns only objects, but malformed entries should
+        # be ignored before any diagnostic access (and never abort the list).
+        raw_indexers = [v for v in raw_indexers if isinstance(v, dict)]
         logger.debug(f"【{self.plugin_name}】Jackett indexers: {[v.get('id') for v in raw_indexers]}")
         indexers = []
         for v in raw_indexers:
-            if not isinstance(v, dict):
-                continue
             indexer_id = v.get("id")
             indexer_name = v.get("name")
             if not indexer_id or not indexer_name:
@@ -957,14 +1152,19 @@ class JackettExtend(_PluginBase):
 
             # E5: public 由 Jackett privacy 字段判断;proxy 与插件配置联动
             privacy = str(v.get("privacy") or "").strip().lower()
+            indexer_id = str(indexer_id).strip()
+            # Preserve the exact ID in the profile for filtering/API calls,
+            # but encode unsafe path/domain characters.  Dots remain intact
+            # so existing virtual domains and IDs continue to round-trip.
+            encoded_indexer_id = quote(indexer_id, safe=".-_~")
             indexers.append({
                 "id": f'{self.plugin_name}-{indexer_name}',
                 "indexer_id": indexer_id,
                 "name": f'{self.plugin_name}-{indexer_name}',
-                "url": f'{self._host.rstrip("/")}/api/v2.0/indexers/{indexer_id}/results/torznab/',
-                "domain": self.jackett_domain.replace(self.plugin_author, str(indexer_id)),
+                "url": f'{host}/api/v2.0/indexers/{encoded_indexer_id}/results/torznab/',
+                "domain": f"{self._domain_prefixes[0]}{encoded_indexer_id}",
                 "public": privacy == "public",
-                "proxy": bool(self._proxy),
+                "proxy": proxy,
                 # V3 site records retain these markers so the host can route
                 # a virtual indexer consistently across current and legacy
                 # SitesHelper implementations.
@@ -1115,12 +1315,13 @@ class JackettExtend(_PluginBase):
         """D6/D8: 日志中的关键词脱敏,仅在 DEBUG/异常上下文使用"""
         if not keyword:
             return ""
-        if len(keyword) <= 4:
-            return "*" * len(keyword)
-        return f"{keyword[:2]}{'*' * min(len(keyword) - 2, 6)}({len(keyword)})"
+        # Do not retain a prefix: titles/names can be identifying even when
+        # only a few leading characters are exposed.  Length is useful for
+        # diagnostics without leaking the original search text.
+        return f"{'*' * min(len(str(keyword)), 12)}({len(str(keyword))})"
 
     def __parse_torznab_xml(self, url, site: dict = None, mtype: Optional[MediaType] = None,
-                            keyword: str = None) -> List[TorrentInfo]:
+                            keyword: str = None, config_snapshot: Optional[dict] = None) -> List[TorrentInfo]:
         """
         从 torznab XML 中解析种子信息
         :param url: XML 数据的 URL
@@ -1129,9 +1330,15 @@ class JackettExtend(_PluginBase):
         if not url:
             return []
         log_url = redact_url(url)
+        request_config = dict(config_snapshot or self._config_for_sync())
+        request_timeout = self._normalize_timeout(
+            request_config.get("timeout", getattr(self, "_timeout", self.SEARCH_TIMEOUT_DEFAULT))
+        )
+        request_proxy = bool(request_config.get("proxy", getattr(self, "_proxy", False)))
         try:
-            ret = RequestUtils(timeout=self._timeout).get_res(url,
-                                                   proxies=settings.PROXY if self._proxy else None)
+            ret = RequestUtils(timeout=request_timeout).get_res(
+                url, proxies=settings.PROXY if request_proxy else None
+            )
         except (requests.Timeout, TimeoutError):
             self._record_error("timeout")
             logger.warning(f"【{self.plugin_name}】torznab 响应超时：url={log_url}")
@@ -1161,15 +1368,39 @@ class JackettExtend(_PluginBase):
             )
             return []
 
+        body = ret.text
+        if not isinstance(body, str) or not body.strip():
+            self._record_error("empty")
+            logger.debug(f"【{self.plugin_name}】torznab 空响应：url={log_url}")
+            return []
+        # Keep minidom bounded and reject DTD/entity declarations before the
+        # parser sees them.  Normal Torznab RSS is small and has no DOCTYPE;
+        # oversized/adversarial payloads are treated as an invalid response.
+        if len(body.encode("utf-8", errors="ignore")) > self.TORZNAB_MAX_XML_BYTES:
+            self._record_error("xml_too_large")
+            logger.warning(f"【{self.plugin_name}】torznab XML 超出大小限制：url={log_url}")
+            return []
+        if re.search(r"<!DOCTYPE\b", body, flags=re.IGNORECASE):
+            self._record_error("xml_doctype")
+            logger.warning(f"【{self.plugin_name}】torznab XML 含不支持的 DOCTYPE：url={log_url}")
+            return []
+
         torrents = []
-        seen_keys = set()
+        # One primary identity per item.  Secondary fields must not be added
+        # to the dedupe set: two releases can legitimately share a GUID while
+        # carrying different infohashes.
+        seen_identities = {}
         try:
             # F3: 保持 stdlib minidom,不加新依赖。torznab:attr 命名空间取值依赖
             # getAttribute,DOM 树整体解析实现简单稳定;ElementTree.iterparse 流式解析
             # 需自行处理命名空间且收益有限,故保留 minidom 并在此标注。
-            dom_tree = xml.dom.minidom.parseString(ret.text)
+            dom_tree = xml.dom.minidom.parseString(body)
             root_node = dom_tree.documentElement
             items = root_node.getElementsByTagName("item")
+            if len(items) > self.TORZNAB_MAX_ITEMS:
+                self._record_error("xml_too_many_items")
+                logger.warning(f"【{self.plugin_name}】torznab XML item 数量超出限制：url={log_url}")
+                return []
         except Exception as e:
             # F1: XML 解析失败降为 WARNING,不输出完整 traceback 刷屏
             self._record_error("xml_error")
@@ -1248,23 +1479,24 @@ class JackettExtend(_PluginBase):
                 if not enclosure:
                     continue
 
-                # One virtual site owns one dedupe scope.  Prefer the most
-                # stable identity in the requested order and never merge
-                # resources from different sites.
+                # One virtual site owns one dedupe scope.  Select exactly one
+                # primary identity in the documented order.  For duplicate
+                # infohashes, an HTTP torrent is more useful than a magnet and
+                # replaces an earlier magnet regardless of item order.
                 identity_values = (
                     ("infohash", infohash),
                     ("guid", guid),
                     ("page_url", page_url),
                     ("enclosure", enclosure),
                 )
-                identity_keys = {
-                    (kind, value.strip().lower())
-                    for kind, value in identity_values
-                    if isinstance(value, str) and value.strip()
-                }
-                if identity_keys.intersection(seen_keys):
-                    continue
-                seen_keys.update(identity_keys)
+                identity_kind, identity_value = next(
+                    ((kind, str(value).strip().lower())
+                     for kind, value in identity_values
+                     if isinstance(value, str) and value.strip()),
+                    ("enclosure", str(enclosure).strip().lower()),
+                )
+                identity = (identity_kind, identity_value)
+                is_http = str(enclosure).strip().lower().startswith(("http://", "https://"))
 
                 # D3: imdbid 映射为 media_source/media_id 媒体身份
                 media_source = None
@@ -1310,6 +1542,14 @@ class JackettExtend(_PluginBase):
                     # mtype 必为 MUSIC，再由上层标题+艺术家匹配筛除无关资源）。
                     category=getattr(mtype, "value", mtype) if mtype else None,
                 )
+                previous = seen_identities.get(identity)
+                if previous is not None:
+                    previous_index, previous_is_http = previous
+                    if is_http and not previous_is_http:
+                        torrents[previous_index] = tmp_dict
+                        seen_identities[identity] = (previous_index, True)
+                    continue
+                seen_identities[identity] = (len(torrents), is_http)
                 torrents.append(tmp_dict)
             except Exception as e:
                 # D8: item 级解析异常附带 URL 与异常类型,降为 DEBUG 避免刷屏

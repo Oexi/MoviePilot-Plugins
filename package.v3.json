@@ -3,11 +3,12 @@
     "name": "JackettExtend",
     "description": "扩展检索以支持Jackett站点资源",
     "labels": "索引器,Jackett",
-    "version": "3.2.5",
+    "version": "3.2.6",
     "icon": "Jackett_A.png",
     "author": "jtcymc",
     "level": 1,
     "history": {
+      "v3.2.6": "修复同步代际竞态、白名单清理、日志搜索词泄露、timeout 非有限值、部分同步误报成功、结果去重和 XML 响应边界问题",
       "v3.2.5": "优化 V3 异步搜索、搜索超时、诊断 API、同步竞态、站点上下文字段和单站点结果去重",
       "v3.2.4": "修复插件 provider 在宿主搜索词清理前被调用的例外：构造 Jackett Torznab q 前复用 MoviePilot 官方标点清理，使插件与内置索引器搜索语义一致",
       "v3.2.3": "通用处理 Jackett Torznab 下载字段：优先保留可校验的 HTTP torrent 链接，magnet-only 结果原样降级且不猜测站点地址，并对错误响应和日志凭据作安全处理",
