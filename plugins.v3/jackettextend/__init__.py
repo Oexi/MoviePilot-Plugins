@@ -1,5 +1,4 @@
 # _*_ coding: utf-8 _*_
-import ast
 import asyncio
 import copy
 import functools
@@ -9,7 +8,7 @@ import threading
 import time
 import xml.dom.minidom
 from typing import List, Dict, Any, Tuple, Optional
-from urllib.parse import urlencode, quote, quote_plus, unquote, urlsplit
+from urllib.parse import urlencode, quote, quote_plus, urlsplit
 
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -47,6 +46,15 @@ from ._torznab import (
     redact_url,
     select_torznab_enclosure,
 )
+from . import _host_compat
+from ._indexers import (
+    apply_indexer_selection,
+    build_indexer_profiles,
+    indexer_id_from_domain,
+    is_virtual_site,
+    parse_indexer_sites,
+    selection_is_explicit,
+)
 
 # V3's module dispatcher awaits async providers.  Prefer the host's context-
 # preserving helper, then FastAPI/Starlette compatibility imports.  The tiny
@@ -75,7 +83,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.2.6"
+    plugin_version = "3.2.7"
     # 插件作者
     plugin_author = "jtcymc"
     # 作者主页
@@ -232,7 +240,16 @@ class JackettExtend(_PluginBase):
             # while its request is in flight.
             self._config_snapshot = self._capture_config_snapshot_locked()
         if not self._enabled:
+            # The compatibility bridge is owned by the plugin lifecycle, not
+            # by module import.  Disabled/reloaded instances must release a
+            # patch only when they are still the current owner.
+            _host_compat.uninstall(self)
             return
+
+        # Install after the new configuration snapshot is published, so a
+        # host search arriving immediately after enable sees the current
+        # generation.  The bridge lazily feature-detects the host boundary.
+        _host_compat.install(self, predicate=self._is_virtual_site)
 
         # 启动定时任务
         self._scheduler = BackgroundScheduler(timezone=settings.TZ)
@@ -314,25 +331,17 @@ class JackettExtend(_PluginBase):
     @classmethod
     def _indexer_id_from_domain(cls, domain: object) -> str:
         """Extract an indexer id from a persisted virtual domain."""
-        value = str(domain or "").strip()
-        for prefix in cls._domain_prefix_set():
-            if value.lower().startswith(prefix):
-                # Domains are synthetic and may contain percent-encoded
-                # special Jackett IDs.  Decode only the suffix; dots remain
-                # intact and therefore continue to identify the same ID.
-                return unquote(value[len(prefix):])
-        return ""
+        return indexer_id_from_domain(domain, cls._domain_prefix_set())
 
     @classmethod
     def _is_virtual_site(cls, site: dict, domain: str = "") -> bool:
         """Recognize both current domains and old records after a reload."""
-        if cls._indexer_id_from_domain(domain):
-            return True
-        markers = {
-            str(site.get("plugin") or "").strip().lower(),
-            str(site.get("parser") or "").strip().lower(),
-        }
-        return cls.plugin_name.lower() in markers
+        return is_virtual_site(
+            site,
+            domain=domain,
+            plugin_name=cls.plugin_name,
+            domain_prefixes=cls._domain_prefix_set(),
+        )
 
     def _sync_is_current(self, generation: Optional[int] = None) -> bool:
         event = self._sync_stop_event
@@ -575,6 +584,7 @@ class JackettExtend(_PluginBase):
         """
         退出插件
         """
+        _host_compat.uninstall(self)
         event = getattr(self, "_sync_stop_event", None)
         if event is not None:
             event.set()
@@ -703,78 +713,21 @@ class JackettExtend(_PluginBase):
         """
         with self._state_lock:
             sites = self._indexer_sites
-        if sites is None:
-            return []
-
-        cleaned = []
-
-        def append_value(value, depth=0):
-            """Flatten ordinary/serialized/nested list forms into IDs."""
-            if depth > 5 or value is None:
-                return
-            if isinstance(value, (list, tuple, set)):
-                for item in value:
-                    append_value(item, depth + 1)
-                return
-            text = str(value).strip()
-            if not text:
-                return
-            # Parse a serialized list at every nesting level (including a
-            # second stringification such as "['[\"a\", \"b\"]']").
-            if text.startswith("[") and text.endswith("]"):
-                try:
-                    parsed = ast.literal_eval(text)
-                except Exception:
-                    parsed = None
-                if isinstance(parsed, (list, tuple)):
-                    append_value(parsed, depth + 1)
-                    return
-            quoted = re.findall(r"[\'\"]([^\'\"]+)[\'\"]", text)
-            if quoted:
-                for item in quoted:
-                    append_value(item, depth + 1)
-                return
-            # A list element may itself be a comma-delimited string.
-            for item in text.strip("[]'\" ").split(","):
-                item = item.strip()
-                if item:
-                    cleaned.append(item)
-
-        append_value(sites)
-
-        # 最后统一 strip/lower/去空去重
-        result = []
-        seen = set()
-        for x in cleaned:
-            x = str(x).strip().lower()
-            if x and x not in seen:
-                seen.add(x)
-                result.append(x)
-        return result
+        return parse_indexer_sites(sites)
 
     def _selection_is_explicit(self) -> bool:
         """Whether an empty parsed selection still represents a finite list."""
         with self._state_lock:
             explicit = getattr(self, "_indexer_sites_explicit", None)
             raw = getattr(self, "_indexer_sites", None)
-        if explicit:
-            return True
-        # Object-level test fixtures and legacy instances may not carry the
-        # flag; a non-empty raw value still unambiguously means finite.
-        return bool(self._parse_indexer_sites()) or bool(raw)
+        return selection_is_explicit(raw, explicit)
 
     def _apply_indexer_selection(self, indexers: object) -> list:
         """Apply the canonical whitelist without turning stale-all into all."""
-        if not isinstance(indexers, list):
-            return []
-        selected_ids = self._parse_indexer_sites()
-        if not selected_ids:
-            return [] if self._selection_is_explicit() else copy.deepcopy(indexers)
-        return [
-            copy.deepcopy(i) for i in indexers
-            if isinstance(i, dict)
-            and str(i.get("indexer_id") or "").strip().lower() in selected_ids
-        ]
+        with self._state_lock:
+            raw_sites = getattr(self, "_indexer_sites", None)
+            explicit = getattr(self, "_indexer_sites_explicit", None)
+        return apply_indexer_selection(indexers, raw_sites, explicit)
 
     def __cleanup_stale_selection(self, authoritative_indexers: Optional[list] = None,
                                   generation: Optional[int] = None):
@@ -979,6 +932,10 @@ class JackettExtend(_PluginBase):
             **kwargs,
         )
 
+    def get_search_page_size(self, site: dict, keyword: str = None) -> Optional[int]:
+        """Jackett virtual profiles do not expose a reliable page size."""
+        return None
+
     def get_indexers(self, filter_selected: bool = True, force_refresh: bool = False,
                      config_snapshot: Optional[dict] = None,
                      generation: Optional[int] = None):
@@ -1118,60 +1075,15 @@ class JackettExtend(_PluginBase):
         # be ignored before any diagnostic access (and never abort the list).
         raw_indexers = [v for v in raw_indexers if isinstance(v, dict)]
         logger.debug(f"【{self.plugin_name}】Jackett indexers: {[v.get('id') for v in raw_indexers]}")
-        indexers = []
-        for v in raw_indexers:
-            indexer_id = v.get("id")
-            indexer_name = v.get("name")
-            if not indexer_id or not indexer_name:
-                continue
-
-            # V3 适配：解析 Jackett caps 生成媒体类型分类。
-            # 宿主索引器契约要求 category 为 {media_type: [分类条目 dict]}，
-            # 条目含 id(选择后回传的分类 ID)与 cat/desc(展示名)。
-            # 之前用布尔 True 占位虽能通过媒体类型列表的 truthy 判断，
-            # 但点击站点打开浏览弹窗时，宿主 GET /site/{id}/category 会迭代
-            # category.values() 并把每个值当作条目列表，布尔值触发
-            # 'bool' object is not iterable，页面弹出"未知错误"。
-            # V3 音乐搜索的站点列表依赖 indexer.category.music 字段，
-            # 无 category 的索引器在音乐搜索中被过滤（电影/电视默认放行）。
-            category = {}
-            for cap in (v.get("caps") or []):
-                if not isinstance(cap, dict):
-                    continue
-                cap_id = str(cap.get("ID", "")).strip()
-                if not cap_id:
-                    continue
-                cap_name = str(cap.get("Name") or "").strip() or cap_id
-                entry = {"id": cap_id, "cat": cap_name, "desc": cap_name}
-                if cap_id.startswith("2000"):
-                    category.setdefault("movie", []).append(entry)
-                elif cap_id.startswith("5000"):
-                    category.setdefault("tv", []).append(entry)
-                elif cap_id.startswith("3000"):
-                    category.setdefault("music", []).append(entry)
-
-            # E5: public 由 Jackett privacy 字段判断;proxy 与插件配置联动
-            privacy = str(v.get("privacy") or "").strip().lower()
-            indexer_id = str(indexer_id).strip()
-            # Preserve the exact ID in the profile for filtering/API calls,
-            # but encode unsafe path/domain characters.  Dots remain intact
-            # so existing virtual domains and IDs continue to round-trip.
-            encoded_indexer_id = quote(indexer_id, safe=".-_~")
-            indexers.append({
-                "id": f'{self.plugin_name}-{indexer_name}',
-                "indexer_id": indexer_id,
-                "name": f'{self.plugin_name}-{indexer_name}',
-                "url": f'{host}/api/v2.0/indexers/{encoded_indexer_id}/results/torznab/',
-                "domain": f"{self._domain_prefixes[0]}{encoded_indexer_id}",
-                "public": privacy == "public",
-                "proxy": proxy,
-                # V3 site records retain these markers so the host can route
-                # a virtual indexer consistently across current and legacy
-                # SitesHelper implementations.
-                "plugin": self.plugin_name,
-                "parser": self.plugin_name,
-                "category": category,
-            })
+        # Pure profile construction is isolated; network/session/config and
+        # generation checks above remain part of this lifecycle-heavy method.
+        indexers = build_indexer_profiles(
+            raw_indexers,
+            host=host,
+            proxy=proxy,
+            plugin_name=self.plugin_name,
+            domain_prefix=self._domain_prefixes[0],
+        )
 
         logger.info(f"【{self.plugin_name}】获取到 {len(indexers)} 个 Jackett indexers")
         return indexers
@@ -1194,16 +1106,12 @@ class JackettExtend(_PluginBase):
         async def _wrapped_async_refresh(*args, **kwargs):
             return await self.async_refresh_torrents(*args, **kwargs)
 
-        def _wrapped_page_size(*args, **kwargs):
-            # D5: 明确告知宿主本插件站点不支持翻页(返回 None)
-            return None
-
         return {
             "search_torrents": _wrapped_search,
             "async_search_torrents": _wrapped_async_search,
             "refresh_torrents": _wrapped_search,
             "async_refresh_torrents": _wrapped_async_refresh,
-            "get_search_page_size": _wrapped_page_size,
+            "get_search_page_size": self.get_search_page_size,
         }
 
     def get_api(self) -> List[Dict[str, Any]]:

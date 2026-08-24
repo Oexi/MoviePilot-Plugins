@@ -3,11 +3,12 @@
     "name": "JackettExtend",
     "description": "扩展检索以支持Jackett站点资源",
     "labels": "索引器,Jackett",
-    "version": "3.2.6",
+    "version": "3.2.7",
     "icon": "Jackett_A.png",
     "author": "jtcymc",
     "level": 1,
     "history": {
+      "v3.2.7": "增加插件侧 SearchChain 站点路由兼容层，覆盖同步、异步、流式搜索和分页容量判断；兼容层支持启停/重载恢复、未来宿主能力探测，并提取纯索引器选择与配置构造逻辑",
       "v3.2.6": "修复同步代际竞态、白名单清理、日志搜索词泄露、timeout 非有限值、部分同步误报成功、结果去重和 XML 响应边界问题",
       "v3.2.5": "优化 V3 异步搜索、搜索超时、诊断 API、同步竞态、站点上下文字段和单站点结果去重",
       "v3.2.4": "修复插件 provider 在宿主搜索词清理前被调用的例外：构造 Jackett Torznab q 前复用 MoviePilot 官方标点清理，使插件与内置索引器搜索语义一致",

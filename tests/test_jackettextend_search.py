@@ -89,7 +89,9 @@ def loaded_plugin_module():
             sys.modules.pop(package_name, None)
         else:
             sys.modules[package_name] = previous_package
-        sys.modules.pop(f"{package_name}._torznab", None)
+        for name in list(sys.modules):
+            if name.startswith(f"{package_name}."):
+                sys.modules.pop(name, None)
 
 
 class JackettSearchKeywordTest(unittest.TestCase):
