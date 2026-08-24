@@ -138,6 +138,23 @@ def loaded_module():
 
 
 class JackettV3ContractTest(unittest.TestCase):
+    @staticmethod
+    def _page_texts(page):
+        values = []
+
+        def walk(node):
+            if isinstance(node, dict):
+                if "text" in node:
+                    values.append(node["text"])
+                for child in node.get("content", []):
+                    walk(child)
+            elif isinstance(node, list):
+                for child in node:
+                    walk(child)
+
+        walk(page)
+        return values
+
     def test_async_module_is_a_real_threadpool_provider(self):
         with loaded_module() as module:
             plugin = object.__new__(module.JackettExtend)
@@ -184,6 +201,31 @@ class JackettV3ContractTest(unittest.TestCase):
                 return False
             self.assertTrue(contains_timeout(form))
 
+    def test_get_page_renders_privacy_types_and_public_fallback(self):
+        with loaded_module() as module:
+            plugin = object.__new__(module.JackettExtend)
+            plugin._indexers = [
+                {"id": "public", "domain": "public", "privacy": "public", "public": True},
+                {"id": "semi", "domain": "semi", "privacy": "semi-private", "public": False},
+                {"id": "private", "domain": "private", "privacy": "private", "public": False},
+                # A profile without new metadata uses the established public
+                # boolean as a coarse fallback.
+                {"id": "fallback-public", "domain": "fallback-public", "public": True},
+                {"id": "fallback-private", "domain": "fallback-private", "public": False},
+                {"id": "unknown", "domain": "unknown", "privacy": "unknown", "public": False},
+                # Invalid legacy data remains visibly unknown rather than
+                # being silently treated as private.
+                {"id": "malformed", "domain": "malformed", "public": "false"},
+            ]
+
+            page = plugin.get_page()
+            texts = self._page_texts(page)
+            self.assertIn("类型", texts)
+            for label in ("公开", "半公开", "私有", "未知"):
+                self.assertIn(label, texts)
+            self.assertNotIn("True", texts)
+            self.assertNotIn("False", texts)
+
     def test_keyword_mask_does_not_retain_original_prefix(self):
         with loaded_module() as module:
             masked = module.JackettExtend._JackettExtend__mask_keyword("Secret Title")
@@ -225,7 +267,7 @@ class JackettV3ContractTest(unittest.TestCase):
                 def json():
                     return [
                         None,
-                        {"id": "foo.bar/baz", "name": "Special", "privacy": "public", "caps": []},
+                        {"id": "foo.bar/baz", "name": "Special", "type": "public", "caps": []},
                     ]
 
             class Request:
@@ -249,6 +291,8 @@ class JackettV3ContractTest(unittest.TestCase):
                 module.RequestUtils = original
             self.assertEqual(len(result), 1)
             self.assertEqual(result[0]["indexer_id"], "foo.bar/baz")
+            self.assertEqual(result[0]["privacy"], "public")
+            self.assertTrue(result[0]["public"])
             self.assertIn("foo.bar%2Fbaz", result[0]["url"])
             self.assertIn("foo.bar%2Fbaz", result[0]["domain"])
 

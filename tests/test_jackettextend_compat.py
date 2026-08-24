@@ -164,12 +164,42 @@ class IndexerHelpersTest(unittest.TestCase):
         profiles = INDEXERS.build_indexer_profiles(raw, "https://jackett.invalid/", True)
         self.assertEqual(len(profiles), 1)
         self.assertEqual(profiles[0]["indexer_id"], "foo/bar")
+        self.assertEqual(profiles[0]["privacy"], "public")
+        self.assertTrue(profiles[0]["public"])
         self.assertIn("foo%2Fbar", profiles[0]["domain"])
         self.assertEqual(profiles[0]["category"]["music"][0]["id"], "3000")
         self.assertEqual(
             INDEXERS.apply_indexer_selection(profiles, ["missing"], explicit=True),
             [],
         )
+
+    def test_jackett_type_maps_to_privacy_without_guessing_unknown_values(self):
+        raw = [
+            {"id": "pub", "name": "Public", "type": "public"},
+            {"id": "semi", "name": "Semi", "type": "semi-private"},
+            {"id": "priv", "name": "Private", "type": "private"},
+            {"id": "legacy", "name": "Legacy", "privacy": "private"},
+            {"id": "odd", "name": "Odd", "type": "not-a-jackett-type"},
+            {"id": "explicit-unknown", "name": "Explicit unknown", "type": "unknown"},
+            {"id": "missing", "name": "Missing", "public": True},
+        ]
+
+        profiles = INDEXERS.build_indexer_profiles(raw, "https://jackett.invalid", False)
+        by_id = {profile["indexer_id"]: profile for profile in profiles}
+
+        self.assertEqual(by_id["pub"]["privacy"], "public")
+        self.assertTrue(by_id["pub"]["public"])
+        self.assertEqual(by_id["semi"]["privacy"], "semi-private")
+        self.assertFalse(by_id["semi"]["public"])
+        self.assertEqual(by_id["priv"]["privacy"], "private")
+        self.assertFalse(by_id["priv"]["public"])
+        self.assertEqual(by_id["legacy"]["privacy"], "private")
+        self.assertIsNone(by_id["odd"]["privacy"])
+        self.assertFalse(by_id["odd"]["public"])
+        self.assertEqual(by_id["explicit-unknown"]["privacy"], "unknown")
+        self.assertFalse(by_id["explicit-unknown"]["public"])
+        self.assertIsNone(by_id["missing"]["privacy"])
+        self.assertTrue(by_id["missing"]["public"])
 
 
 if __name__ == "__main__":

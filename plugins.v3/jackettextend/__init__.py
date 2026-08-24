@@ -52,6 +52,7 @@ from ._indexers import (
     build_indexer_profiles,
     indexer_id_from_domain,
     is_virtual_site,
+    privacy_label,
     parse_indexer_sites,
     selection_is_explicit,
 )
@@ -83,7 +84,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.2.7"
+    plugin_version = "3.2.8"
     # 插件作者
     plugin_author = "jtcymc"
     # 作者主页
@@ -1728,7 +1729,7 @@ class JackettExtend(_PluginBase):
                     },
                     {
                         'component': 'td',
-                        'text': site.get("public")
+                        'text': privacy_label(site.get("privacy"), site.get("public"))
                     }
                 ]
             })
@@ -1774,7 +1775,7 @@ class JackettExtend(_PluginBase):
                                                         'props': {
                                                             'class': 'text-start ps-4'
                                                         },
-                                                        'text': '是否公开'
+                                                        'text': '类型'
                                                     }
                                                 ]
                                             }

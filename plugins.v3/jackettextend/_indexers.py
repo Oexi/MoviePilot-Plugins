@@ -14,6 +14,83 @@ from typing import Mapping, Optional, Sequence
 from urllib.parse import quote, unquote
 
 
+PRIVACY_PUBLIC = "public"
+PRIVACY_SEMI_PRIVATE = "semi-private"
+PRIVACY_PRIVATE = "private"
+PRIVACY_UNKNOWN = "unknown"
+
+_PRIVACY_ALIASES = {
+    PRIVACY_PUBLIC: PRIVACY_PUBLIC,
+    PRIVACY_SEMI_PRIVATE: PRIVACY_SEMI_PRIVATE,
+    "semi_private": PRIVACY_SEMI_PRIVATE,
+    "semi private": PRIVACY_SEMI_PRIVATE,
+    # Keep compatibility with older integrations that used the alternate
+    # spelling; Jackett's current definitions use ``semi-private``.
+    "semi-public": PRIVACY_SEMI_PRIVATE,
+    "semi_public": PRIVACY_SEMI_PRIVATE,
+    "semi public": PRIVACY_SEMI_PRIVATE,
+    PRIVACY_PRIVATE: PRIVACY_PRIVATE,
+    PRIVACY_UNKNOWN: PRIVACY_UNKNOWN,
+}
+
+
+def normalize_privacy(value: object) -> Optional[str]:
+    """Normalize a Jackett privacy/type value to a known category.
+
+    Jackett's configured-indexer endpoint calls this field ``type`` and
+    reports ``public``, ``semi-private`` or ``private``.  ``privacy`` is
+    accepted as a compatibility fallback for callers/older response shapes;
+    values outside the known vocabulary are never guessed as private.
+    """
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    return _PRIVACY_ALIASES.get(text)
+
+
+def indexer_privacy(value: object) -> Optional[str]:
+    """Extract a reliable privacy value from one Jackett indexer row.
+
+    ``type`` is authoritative for the current Jackett endpoint.  The
+    historical ``privacy`` key is used only when ``type`` is absent/empty.
+    An explicit ``unknown`` value is preserved for the UI.  Unsupported or
+    absent values return ``None`` so the caller can use the existing
+    ``public`` fallback instead of inventing a more precise type.
+    """
+    if not isinstance(value, Mapping):
+        return None
+    for key in ("type", "privacy"):
+        raw = value.get(key)
+        if raw is None or not str(raw).strip():
+            continue
+        return normalize_privacy(raw)
+    return None
+
+
+def privacy_label(value: object, public: object = None) -> str:
+    """Render a profile privacy value using the fixed Chinese UI vocabulary."""
+    privacy = normalize_privacy(value)
+    labels = {
+        PRIVACY_PUBLIC: "公开",
+        PRIVACY_SEMI_PRIVATE: "半公开",
+        PRIVACY_PRIVATE: "私有",
+        PRIVACY_UNKNOWN: "未知",
+    }
+    if privacy in labels:
+        return labels[privacy]
+    # Profiles from older/cached data may not carry privacy metadata.  The
+    # boolean is an intentionally coarse fallback and never implies
+    # semi-private precision.  Integer values are accepted for site rows
+    # loaded from the host DB (0/1 are its public-field representation).
+    if isinstance(public, bool):
+        return "公开" if public else "私有"
+    if isinstance(public, int) and public in (0, 1):
+        return "公开" if public else "私有"
+    return "未知"
+
+
 def parse_indexer_sites(value: object) -> list:
     """Normalize UI/API/legacy whitelist values into lower-case IDs.
 
@@ -166,14 +243,21 @@ def build_indexer_profiles(raw_indexers: object,
         if not indexer_id:
             continue
         encoded_id = quote(indexer_id, safe=".-_~")
-        privacy = str(value.get("privacy") or "").strip().lower()
+        privacy = indexer_privacy(value)
+        if privacy is None:
+            # Preserve the established boolean semantics while accepting a
+            # legacy/profile-shaped row that already carries ``public``.
+            public = value.get("public") if isinstance(value.get("public"), bool) else False
+        else:
+            public = privacy == PRIVACY_PUBLIC
         profiles.append({
             "id": f"{plugin_name}-{indexer_name}",
             "indexer_id": indexer_id,
             "name": f"{plugin_name}-{indexer_name}",
             "url": f"{normalized_host}/api/v2.0/indexers/{encoded_id}/results/torznab/",
             "domain": f"{domain_prefix}{encoded_id}",
-            "public": privacy == "public",
+            "public": public,
+            "privacy": privacy,
             "proxy": bool(proxy),
             # Keep explicit ownership markers on every injected profile.
             "plugin": plugin_name,
