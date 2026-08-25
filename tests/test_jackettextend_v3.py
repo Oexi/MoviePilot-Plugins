@@ -495,6 +495,33 @@ class JackettV3ContractTest(unittest.TestCase):
             self.assertEqual(result[0].title, "HTTP second")
             self.assertTrue(result[0].enclosure.startswith("https://"))
 
+    def test_parser_rejects_http_200_torznab_error_without_leaking_details(self):
+        with loaded_module() as module:
+            _RequestUtils.response = _Response()
+            _RequestUtils.response.text = (
+                '<?xml version="1.0"?><error code="100" '
+                'description="secret diagnostic"/>'
+            )
+            logs = []
+            module.logger = types.SimpleNamespace(
+                warning=lambda message: logs.append(message),
+            )
+            plugin = object.__new__(module.JackettExtend)
+            plugin._timeout = 12
+            plugin._proxy = False
+            plugin._last_error = None
+            plugin._state_lock = module.JackettExtend._state_lock
+            result = plugin._JackettExtend__parse_torznab_xml(
+                "https://jackett.invalid/results?q=private-title&apikey=secret",
+            )
+            self.assertEqual(result, [])
+            self.assertEqual(plugin._last_error, "torznab_error")
+            rendered_logs = " ".join(logs)
+            self.assertNotIn("description", rendered_logs)
+            self.assertNotIn("secret diagnostic", rendered_logs)
+            self.assertNotIn("secret", rendered_logs)
+            self.assertNotIn("private-title", rendered_logs)
+
     def test_parser_rejects_doctype_and_oversized_body(self):
         with loaded_module() as module:
             plugin = object.__new__(module.JackettExtend)

@@ -84,7 +84,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.2.8"
+    plugin_version = "3.2.9"
     # 插件作者
     plugin_author = "jtcymc"
     # 作者主页
@@ -1305,6 +1305,11 @@ class JackettExtend(_PluginBase):
             # 需自行处理命名空间且收益有限,故保留 minidom 并在此标注。
             dom_tree = xml.dom.minidom.parseString(body)
             root_node = dom_tree.documentElement
+            root_name = getattr(root_node, "localName", None) or root_node.tagName.rsplit(":", 1)[-1]
+            if root_name.lower() == "error":
+                self._record_error("torznab_error")
+                logger.warning(f"【{self.plugin_name}】torznab 返回错误 XML")
+                return []
             items = root_node.getElementsByTagName("item")
             if len(items) > self.TORZNAB_MAX_ITEMS:
                 self._record_error("xml_too_many_items")
