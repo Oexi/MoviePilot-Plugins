@@ -3,11 +3,12 @@
     "name": "JackettExtend",
     "description": "扩展检索以支持Jackett站点资源",
     "labels": "索引器,Jackett",
-    "version": "3.2.9",
+    "version": "3.2.10",
     "icon": "Jackett_A.png",
     "author": "jtcymc",
     "level": 1,
     "history": {
+      "v3.2.10": "修复 IMDb 身份值校验及 Torznab 数值字段的非有限值和负值边界",
       "v3.2.9": "修复 Jackett Torznab HTTP 200 错误 XML 被误判为空结果",
       "v3.2.8": "优化 Jackett 索引器类型展示，支持公开、半公开、私有和未知状态，并完善类型字段兼容",
       "v3.2.7": "增加插件侧 SearchChain 站点路由兼容层，覆盖同步、异步、流式搜索和分页容量判断；兼容层支持启停/重载恢复、未来宿主能力探测，并提取纯索引器选择与配置构造逻辑",
