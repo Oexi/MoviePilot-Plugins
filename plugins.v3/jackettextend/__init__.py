@@ -1200,24 +1200,47 @@ class JackettExtend(_PluginBase):
         """D2: 转为 int,解析失败回退 0"""
         try:
             return int(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return 0
 
     @staticmethod
     def __safe_float(value):
-        """D2: 转为 float,解析失败回退 0"""
+        """D2: 转为非负有限 float,非法值回退 0"""
         try:
-            return float(value)
-        except (TypeError, ValueError):
+            numeric = float(value)
+        except (TypeError, ValueError, OverflowError):
             return 0.0
+        return numeric if math.isfinite(numeric) and numeric >= 0 else 0.0
+
+    @staticmethod
+    def __safe_count(value):
+        """计数仅接受非负整数，非法值沿用 0 回退。"""
+        try:
+            numeric = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        return numeric if numeric >= 0 else 0
 
     @staticmethod
     def __safe_float_none(value):
         """促销因子解析失败回退 None(避免把非法值误判为 0/free)"""
-        try:
-            return float(value) if value not in (None, "") else None
-        except (TypeError, ValueError):
+        if value in (None, ""):
             return None
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return numeric if math.isfinite(numeric) and numeric >= 0 else None
+
+    @staticmethod
+    def __normalize_imdbid(value):
+        """规范化合法 IMDb ID；非法值不建立媒体身份。"""
+        candidate = str(value or "").strip().lower()
+        if not re.fullmatch(r"tt[0-9]{7,}", candidate):
+            return ""
+        if set(candidate[2:]) == {"0"}:
+            return ""
+        return candidate
 
     @staticmethod
     def __mask_keyword(keyword):
@@ -1372,7 +1395,7 @@ class JackettExtend(_PluginBase):
                     elif name == "hit_and_run":
                         hit_and_run = str(value).strip().lower() in ("1", "true", "yes")
                     elif name == "imdbid":
-                        imdbid = str(value).strip()
+                        imdbid = self.__normalize_imdbid(value)
                     elif name in ("infohash", "info_hash"):
                         infohash = str(value).strip()
                     elif name == "magneturl":
@@ -1427,11 +1450,11 @@ class JackettExtend(_PluginBase):
                     title=title,
                     enclosure=enclosure,
                     description=description,
-                    # D2: seeders/peers 转 int,size 转 float,解析失败回退 0
+                    # D2: size/计数安全转换，非法或负值回退 0
                     size=self.__safe_float(size),
-                    seeders=self.__safe_int(seeders),
-                    peers=self.__safe_int(peers),
-                    grabs=self.__safe_int(grabs),
+                    seeders=self.__safe_count(seeders),
+                    peers=self.__safe_count(peers),
+                    grabs=self.__safe_count(grabs),
                     # V3 适配：显示真实站点名（原版硬编码 jackett_domain 导致结果来源显示无意义域名）
                     site=site.get("id") if site else None,
                     site_name=site.get("name", self.plugin_name) if site else self.plugin_name,

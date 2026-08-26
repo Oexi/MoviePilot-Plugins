@@ -1,6 +1,7 @@
 import asyncio
 import importlib.util
 import inspect
+import json
 import sys
 import threading
 import types
@@ -443,7 +444,10 @@ class JackettV3ContractTest(unittest.TestCase):
               <item><title>One</title><guid>same-guid</guid><comments>https://site/item/1</comments>
                 <enclosure url='https://site/one.torrent'/><size>12</size>
                 <torznab:attr xmlns:torznab='http://torznab.com/schemas/2015/feed' name='seeders' value='4'/>
+                <torznab:attr xmlns:torznab='http://torznab.com/schemas/2015/feed' name='peers' value='5'/>
                 <torznab:attr xmlns:torznab='http://torznab.com/schemas/2015/feed' name='grabs' value='7'/>
+                <torznab:attr xmlns:torznab='http://torznab.com/schemas/2015/feed' name='uploadvolumefactor' value='2.5'/>
+                <torznab:attr xmlns:torznab='http://torznab.com/schemas/2015/feed' name='downloadvolumefactor' value='0'/>
                 <torznab:attr xmlns:torznab='http://torznab.com/schemas/2015/feed' name='infohash' value='abc'/>
                 <torznab:attr xmlns:torznab='http://torznab.com/schemas/2015/feed' name='label' value='trusted'/>
               </item>
@@ -463,13 +467,190 @@ class JackettV3ContractTest(unittest.TestCase):
                 mtype=_MediaType.MUSIC,
             )
             self.assertEqual(len(result), 3)
+            self.assertEqual(result[0].size, 12.0)
+            self.assertEqual(result[0].seeders, 4)
+            self.assertEqual(result[0].peers, 5)
             self.assertEqual(result[0].grabs, 7)
+            self.assertEqual(result[0].uploadvolumefactor, 2.5)
+            self.assertEqual(result[0].downloadvolumefactor, 0.0)
             self.assertEqual(result[0].site, 3)
             self.assertEqual(result[0].site_cookie, "cookie")
             self.assertEqual(result[0].site_order, 2)
             self.assertEqual(result[0].labels, ["trusted"])
             self.assertEqual(result[0].category, "音乐")
             self.assertEqual(_RequestUtils.timeouts[-1], 12)
+
+    def test_parser_normalizes_valid_imdb_identity(self):
+        with loaded_module() as module:
+            _RequestUtils.response = _Response()
+            _RequestUtils.response.text = """<?xml version='1.0'?><rss><channel>
+              <item><title>IMDb result</title><enclosure url='https://site/imdb.torrent'/>
+                <torznab:attr xmlns:torznab='http://torznab.com/schemas/2015/feed' name='imdbid' value=' TT1234567 '/>
+              </item>
+            </channel></rss>"""
+            plugin = object.__new__(module.JackettExtend)
+            plugin._timeout = 12
+            plugin._proxy = False
+            plugin._last_error = None
+            plugin._state_lock = module.JackettExtend._state_lock
+
+            result = plugin._JackettExtend__parse_torznab_xml(
+                "https://jackett.invalid/results",
+                site={"name": "Nyaa"},
+            )
+
+            self.assertEqual(len(result), 1)
+            self.assertEqual(result[0].media_source, _MediaSource.IMDb)
+            self.assertEqual(result[0].media_id, "tt1234567")
+
+    def test_parser_accepts_imdb_identity_without_maximum_digit_count(self):
+        with loaded_module() as module:
+            _RequestUtils.response = _Response()
+            _RequestUtils.response.text = """<?xml version='1.0'?><rss><channel>
+              <item><title>Long IMDb result</title><enclosure url='https://site/long-imdb.torrent'/>
+                <torznab:attr xmlns:torznab='http://torznab.com/schemas/2015/feed' name='imdbid' value='tt12345678901234567890'/>
+              </item>
+            </channel></rss>"""
+            plugin = object.__new__(module.JackettExtend)
+            plugin._timeout = 12
+            plugin._proxy = False
+            plugin._last_error = None
+            plugin._state_lock = module.JackettExtend._state_lock
+
+            result = plugin._JackettExtend__parse_torznab_xml(
+                "https://jackett.invalid/results",
+                site={"name": "Nyaa"},
+            )
+
+            self.assertEqual(len(result), 1)
+            self.assertEqual(result[0].media_source, _MediaSource.IMDb)
+            self.assertEqual(result[0].media_id, "tt12345678901234567890")
+
+    def test_parser_keeps_torrents_with_invalid_imdb_identity_unset(self):
+        invalid_values = (
+            "",
+            "1234567",
+            "tt123456",
+            "TT0000000000",
+            "tt123456x",
+            "tt1234567!",
+            "tt１２３４５６７",
+        )
+        items = "".join(
+            f"""<item><title>Invalid IMDb {index}</title>
+              <enclosure url='https://site/invalid-imdb-{index}.torrent'/>
+              <torznab:attr xmlns:torznab='http://torznab.com/schemas/2015/feed'
+                name='imdbid' value='{value}'/>
+            </item>"""
+            for index, value in enumerate(invalid_values)
+        )
+
+        with loaded_module() as module:
+            _RequestUtils.response = _Response()
+            _RequestUtils.response.text = f"<?xml version='1.0'?><rss><channel>{items}</channel></rss>"
+            plugin = object.__new__(module.JackettExtend)
+            plugin._timeout = 12
+            plugin._proxy = False
+            plugin._last_error = None
+            plugin._state_lock = module.JackettExtend._state_lock
+
+            result = plugin._JackettExtend__parse_torznab_xml(
+                "https://jackett.invalid/results",
+                site={"name": "Nyaa"},
+            )
+
+            self.assertEqual(len(result), len(invalid_values))
+            for torrent in result:
+                self.assertIsNone(torrent.media_source)
+                self.assertIsNone(torrent.media_id)
+
+    def test_parser_falls_back_for_negative_size_and_counts(self):
+        with loaded_module() as module:
+            _RequestUtils.response = _Response()
+            _RequestUtils.response.text = """<?xml version='1.0'?><rss><channel>
+              <item><title>Negative numerics</title><enclosure url='https://site/negative.torrent'/>
+                <size>-1</size>
+                <torznab:attr xmlns:torznab='http://torznab.com/schemas/2015/feed' name='seeders' value='-2'/>
+                <torznab:attr xmlns:torznab='http://torznab.com/schemas/2015/feed' name='peers' value='-3'/>
+                <torznab:attr xmlns:torznab='http://torznab.com/schemas/2015/feed' name='grabs' value='-4'/>
+              </item>
+            </channel></rss>"""
+            plugin = object.__new__(module.JackettExtend)
+            plugin._timeout = 12
+            plugin._proxy = False
+            plugin._last_error = None
+            plugin._state_lock = module.JackettExtend._state_lock
+
+            result = plugin._JackettExtend__parse_torznab_xml(
+                "https://jackett.invalid/results",
+                site={"name": "Nyaa"},
+            )
+
+            self.assertEqual(len(result), 1)
+            self.assertEqual(result[0].size, 0.0)
+            self.assertEqual(result[0].seeders, 0)
+            self.assertEqual(result[0].peers, 0)
+            self.assertEqual(result[0].grabs, 0)
+
+    def test_parser_falls_back_for_invalid_size_and_counts_and_is_strict_json_safe(self):
+        for index, value in enumerate(("not-a-number", "NaN", "Infinity", "-Infinity")):
+            with self.subTest(value=value), loaded_module() as module:
+                _RequestUtils.response = _Response()
+                _RequestUtils.response.text = f"""<?xml version='1.0'?><rss><channel>
+                  <item><title>Nonfinite numerics {index}</title>
+                    <enclosure url='https://site/nonfinite-{index}.torrent'/>
+                    <size>{value}</size>
+                    <torznab:attr xmlns:torznab='http://torznab.com/schemas/2015/feed' name='seeders' value='{value}'/>
+                    <torznab:attr xmlns:torznab='http://torznab.com/schemas/2015/feed' name='peers' value='{value}'/>
+                    <torznab:attr xmlns:torznab='http://torznab.com/schemas/2015/feed' name='grabs' value='{value}'/>
+                  </item>
+                </channel></rss>"""
+                plugin = object.__new__(module.JackettExtend)
+                plugin._timeout = 12
+                plugin._proxy = False
+                plugin._last_error = None
+                plugin._state_lock = module.JackettExtend._state_lock
+
+                result = plugin._JackettExtend__parse_torznab_xml(
+                    "https://jackett.invalid/results",
+                    site={"name": "Nyaa"},
+                )
+
+                self.assertEqual(len(result), 1)
+                self.assertEqual(result[0].size, 0.0)
+                self.assertEqual(result[0].seeders, 0)
+                self.assertEqual(result[0].peers, 0)
+                self.assertEqual(result[0].grabs, 0)
+                json.dumps(result[0].__dict__, allow_nan=False)
+
+    def test_parser_rejects_invalid_promotion_factors_without_marking_free(self):
+        for index, value in enumerate(("NaN", "Infinity", "-Infinity", "-1")):
+            with self.subTest(value=value), loaded_module() as module:
+                _RequestUtils.response = _Response()
+                _RequestUtils.response.text = f"""<?xml version='1.0'?><rss><channel>
+                  <item><title>Invalid factors {index}</title>
+                    <enclosure url='https://site/invalid-factors-{index}.torrent'/>
+                    <torznab:attr xmlns:torznab='http://torznab.com/schemas/2015/feed'
+                      name='uploadvolumefactor' value='{value}'/>
+                    <torznab:attr xmlns:torznab='http://torznab.com/schemas/2015/feed'
+                      name='downloadvolumefactor' value='{value}'/>
+                  </item>
+                </channel></rss>"""
+                plugin = object.__new__(module.JackettExtend)
+                plugin._timeout = 12
+                plugin._proxy = False
+                plugin._last_error = None
+                plugin._state_lock = module.JackettExtend._state_lock
+
+                result = plugin._JackettExtend__parse_torznab_xml(
+                    "https://jackett.invalid/results",
+                    site={"name": "Nyaa"},
+                )
+
+                self.assertEqual(len(result), 1)
+                self.assertIsNone(result[0].uploadvolumefactor)
+                self.assertIsNone(result[0].downloadvolumefactor)
+                json.dumps(result[0].__dict__, allow_nan=False)
 
     def test_parser_duplicate_infohash_prefers_http_torrent_over_magnet(self):
         with loaded_module() as module:
