@@ -3,11 +3,12 @@
     "name": "JackettExtend",
     "description": "扩展检索以支持Jackett站点资源",
     "labels": "索引器,Jackett",
-    "version": "3.2.14",
+    "version": "3.2.15",
     "icon": "Jackett_A.png",
     "author": "jtcymc",
     "level": 1,
     "history": {
+      "v3.2.15": "收窄当前 MoviePilot V3 搜索桥接，仅保留按站点同步/异步 Monkey Patch，page-size 改由官方 provider 分发",
       "v3.2.14": "收敛为仅支持当前 MoviePilot V3 公共 SDK 与搜索合同，退役 V2 实现及历史兼容分支",
       "v3.2.13": "完成 UI 与 Torznab 纯逻辑模块化，并补齐站点同步边界保护测试",
       "v3.2.12": "隔离同步、搜索与连接探测诊断状态，避免错误信息相互覆盖",
