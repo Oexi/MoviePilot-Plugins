@@ -36,14 +36,20 @@ except ImportError:
         from app.schemas.types import MediaSource
     except ImportError:
         MediaSource = None
-from app.sdk.utilities import DomUtils
 from app.sdk.network import RequestUtils
 from app.sdk.utilities import StringUtils
 
 from ._torznab import (
     classify_torznab_response,
+    extract_torznab_item,
     redact_url,
+    safe_count,
+    safe_float,
+    safe_float_none,
+    safe_int,
+    select_torznab_identity,
     select_torznab_enclosure,
+    should_replace_torznab_duplicate,
 )
 from . import _host_compat
 from ._indexers import (
@@ -51,10 +57,10 @@ from ._indexers import (
     build_indexer_profiles,
     indexer_id_from_domain,
     is_virtual_site,
-    privacy_label,
     parse_indexer_sites,
     selection_is_explicit,
 )
+from ._ui import build_form, build_page
 
 # V3's module dispatcher awaits async providers.  Prefer the host's context-
 # preserving helper, then FastAPI/Starlette compatibility imports.  The tiny
@@ -83,7 +89,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.2.12"
+    plugin_version = "3.2.13"
     # 插件作者
     plugin_author = "jtcymc"
     # 作者主页
@@ -1251,53 +1257,6 @@ class JackettExtend(_PluginBase):
         return self._diagnostic_payload(probe=False)
 
     @staticmethod
-    def __safe_int(value):
-        """D2: 转为 int,解析失败回退 0"""
-        try:
-            return int(value)
-        except (TypeError, ValueError, OverflowError):
-            return 0
-
-    @staticmethod
-    def __safe_float(value):
-        """D2: 转为非负有限 float,非法值回退 0"""
-        try:
-            numeric = float(value)
-        except (TypeError, ValueError, OverflowError):
-            return 0.0
-        return numeric if math.isfinite(numeric) and numeric >= 0 else 0.0
-
-    @staticmethod
-    def __safe_count(value):
-        """计数仅接受非负整数，非法值沿用 0 回退。"""
-        try:
-            numeric = int(value)
-        except (TypeError, ValueError, OverflowError):
-            return 0
-        return numeric if numeric >= 0 else 0
-
-    @staticmethod
-    def __safe_float_none(value):
-        """促销因子解析失败回退 None(避免把非法值误判为 0/free)"""
-        if value in (None, ""):
-            return None
-        try:
-            numeric = float(value)
-        except (TypeError, ValueError, OverflowError):
-            return None
-        return numeric if math.isfinite(numeric) and numeric >= 0 else None
-
-    @staticmethod
-    def __normalize_imdbid(value):
-        """规范化合法 IMDb ID；非法值不建立媒体身份。"""
-        candidate = str(value or "").strip().lower()
-        if not re.fullmatch(r"tt[0-9]{7,}", candidate):
-            return ""
-        if set(candidate[2:]) == {"0"}:
-            return ""
-        return candidate
-
-    @staticmethod
     def __mask_keyword(keyword):
         """D6/D8: 日志中的关键词脱敏,仅在 DEBUG/异常上下文使用"""
         if not keyword:
@@ -1401,66 +1360,31 @@ class JackettExtend(_PluginBase):
 
         for item in items:
             try:
-                # 标题
-                title = DomUtils.tag_value(item, "title", default="")
+                # Pure DOM/torznab extraction is isolated from host adapters;
+                # StringUtils/TorrentInfo handling remains in this entrypoint.
+                item_fields = extract_torznab_item(item)
+                title = item_fields["title"]
                 if not title:
                     continue
-                # 种子链接
-                enclosure = DomUtils.tag_value(item, "enclosure", "url", default="")
-                link = DomUtils.tag_value(item, "link", default="")
-                guid = DomUtils.tag_value(item, "guid", default="")
-                # 描述
-                description = DomUtils.tag_value(item, "description", default="")
-                # 种子大小
-                size = DomUtils.tag_value(item, "size", default=0)
-                # 种子页面
-                page_url = DomUtils.tag_value(item, "comments", default="")
-                # 发布时间
-                pubdate = DomUtils.tag_value(item, "pubDate", default="")
+                enclosure = item_fields["enclosure"]
+                link = item_fields["link"]
+                guid = item_fields["guid"]
+                description = item_fields["description"]
+                size = item_fields["size"]
+                page_url = item_fields["page_url"]
+                pubdate = item_fields["pubdate"]
                 if pubdate:
                     pubdate = StringUtils.unify_datetime_str(pubdate)
-                # 做种数
-                seeders = 0
-                # 下载数
-                peers = 0
-                # Media identity is represented by media_source/media_id in
-                # V3; never pass the removed V2 ``imdbid`` constructor field.
-                imdbid = ""
-                infohash = ""
-                grabs = 0
-                labels = []
-                # 促销因子/HR
-                uploadvolumefactor = None
-                downloadvolumefactor = None
-                hit_and_run = False
-                magnet_url = ""
-
-                torznab_attrs = item.getElementsByTagName("torznab:attr")
-                for torznab_attr in torznab_attrs:
-                    name = torznab_attr.getAttribute('name')
-                    value = torznab_attr.getAttribute('value')
-                    if name == "seeders":
-                        seeders = value
-                    elif name == "peers":
-                        peers = value
-                    elif name == "downloadvolumefactor":
-                        downloadvolumefactor = value
-                    elif name == "uploadvolumefactor":
-                        uploadvolumefactor = value
-                    elif name == "hit_and_run":
-                        hit_and_run = str(value).strip().lower() in ("1", "true", "yes")
-                    elif name == "imdbid":
-                        imdbid = self.__normalize_imdbid(value)
-                    elif name in ("infohash", "info_hash"):
-                        infohash = str(value).strip()
-                    elif name == "magneturl":
-                        magnet_url = value
-                    elif name == "grabs":
-                        grabs = value
-                    elif name in ("label", "tag"):
-                        label = str(value).strip()
-                        if label and label not in labels:
-                            labels.append(label)
+                seeders = item_fields["seeders"]
+                peers = item_fields["peers"]
+                imdbid = item_fields["imdbid"]
+                infohash = item_fields["infohash"]
+                grabs = item_fields["grabs"]
+                labels = item_fields["labels"]
+                uploadvolumefactor = item_fields["uploadvolumefactor"]
+                downloadvolumefactor = item_fields["downloadvolumefactor"]
+                hit_and_run = item_fields["hit_and_run"]
+                magnet_url = item_fields["magnet_url"]
 
                 enclosure = select_torznab_enclosure(
                     enclosure=enclosure,
@@ -1475,20 +1399,12 @@ class JackettExtend(_PluginBase):
                 # primary identity in the documented order.  For duplicate
                 # infohashes, an HTTP torrent is more useful than a magnet and
                 # replaces an earlier magnet regardless of item order.
-                identity_values = (
-                    ("infohash", infohash),
-                    ("guid", guid),
-                    ("page_url", page_url),
-                    ("enclosure", enclosure),
+                identity = select_torznab_identity(
+                    infohash=infohash,
+                    guid=guid,
+                    page_url=page_url,
+                    enclosure=enclosure,
                 )
-                identity_kind, identity_value = next(
-                    ((kind, str(value).strip().lower())
-                     for kind, value in identity_values
-                     if isinstance(value, str) and value.strip()),
-                    ("enclosure", str(enclosure).strip().lower()),
-                )
-                identity = (identity_kind, identity_value)
-                is_http = str(enclosure).strip().lower().startswith(("http://", "https://"))
 
                 # D3: imdbid 映射为 media_source/media_id 媒体身份
                 media_source = None
@@ -1506,23 +1422,23 @@ class JackettExtend(_PluginBase):
                     enclosure=enclosure,
                     description=description,
                     # D2: size/计数安全转换，非法或负值回退 0
-                    size=self.__safe_float(size),
-                    seeders=self.__safe_count(seeders),
-                    peers=self.__safe_count(peers),
-                    grabs=self.__safe_count(grabs),
+                    size=safe_float(size),
+                    seeders=safe_count(seeders),
+                    peers=safe_count(peers),
+                    grabs=safe_count(grabs),
                     # V3 适配：显示真实站点名（原版硬编码 jackett_domain 导致结果来源显示无意义域名）
                     site=site.get("id") if site else None,
                     site_name=site.get("name", self.plugin_name) if site else self.plugin_name,
                     site_cookie=site.get("cookie") if site else None,
                     site_ua=site.get("ua") if site else None,
                     site_proxy=bool(site.get("proxy")) if site else False,
-                    site_order=self.__safe_int(site.get("pri", site.get("order", 0))) if site else 0,
+                    site_order=safe_int(site.get("pri", site.get("order", 0))) if site else 0,
                     site_downloader=site.get("downloader") if site else None,
                     page_url=page_url,
                     # D3: pubdate/促销因子/HR 传入 TorrentInfo,支持发布时长与促销过滤
                     pubdate=pubdate or None,
-                    uploadvolumefactor=self.__safe_float_none(uploadvolumefactor),
-                    downloadvolumefactor=self.__safe_float_none(downloadvolumefactor),
+                    uploadvolumefactor=safe_float_none(uploadvolumefactor),
+                    downloadvolumefactor=safe_float_none(downloadvolumefactor),
                     hit_and_run=bool(hit_and_run),
                     media_source=media_source,
                     media_id=media_id,
@@ -1536,12 +1452,12 @@ class JackettExtend(_PluginBase):
                 )
                 previous = seen_identities.get(identity)
                 if previous is not None:
-                    previous_index, previous_is_http = previous
-                    if is_http and not previous_is_http:
+                    previous_index, previous_enclosure = previous
+                    if should_replace_torznab_duplicate(previous_enclosure, enclosure):
                         torrents[previous_index] = tmp_dict
-                        seen_identities[identity] = (previous_index, True)
+                        seen_identities[identity] = (previous_index, enclosure)
                     continue
-                seen_identities[identity] = (len(torrents), is_http)
+                seen_identities[identity] = (len(torrents), enclosure)
                 torrents.append(tmp_dict)
             except Exception as e:
                 # D8: item 级解析异常附带 URL 与异常类型,降为 DEBUG 避免刷屏
@@ -1566,207 +1482,12 @@ class JackettExtend(_PluginBase):
                                      "value": idx.get('indexer_id')})
         except Exception as e:
             logger.warning(f"【{self.plugin_name}】获取索引器选项失败: {str(e)}")
-        return [
-            {
-                'component': 'VForm',
-                'content': [
-                    # G2: 修复 VRow 嵌套,各行平级
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 6
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'enabled',
-                                            'label': '启用插件',
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 6
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'timeout',
-                                            'label': '搜索超时（秒）',
-                                            'placeholder': str(self.SEARCH_TIMEOUT_DEFAULT),
-                                            'hint': f'仅用于 Torznab 搜索，范围 {self.SEARCH_TIMEOUT_MIN}-{self.SEARCH_TIMEOUT_MAX} 秒，超出范围会自动限制'
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 6
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'proxy',
-                                            'label': '使用代理服务器',
-                                        }
-                                    }
-                                ]
-                            },
-                        ]
-                    },
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 6
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'host',
-                                            'label': 'Jackett地址',
-                                            'placeholder': 'http://127.0.0.1:9117',
-                                            'hint': 'Jackett访问地址和端口，如为https需加https://前缀。注意需要先在Jackett中添加indexer，才能正常测试通过和使用'
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 6
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'api_key',
-                                            'label': 'Api Key',
-                                            'placeholder': '',
-                                            'hint': 'Jackett管理界面右上角复制API Key'
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 6
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'password',
-                                            'label': '密码',
-                                            'placeholder': '',
-                                            'hint': 'Jackett管理界面中配置的Admin password，如未配置可为空',
-                                            'type': 'password'
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 6
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'cron',
-                                            'label': '更新周期',
-                                            'placeholder': '0 0 * * *',
-                                            'hint': '索引列表更新周期，支持5位cron表达式，默认每24小时运行一次'
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 6
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VSelect',
-                                        'props': {
-                                            'model': 'indexer_sites',
-                                            'label': '添加索引器(留空=全部)',
-                                            'hint': '勾选后仅添加选中的Jackett索引器，未选中的排除；留空添加全部',
-                                            'chips': True,
-                                            'multiple': True,
-                                            'items': site_options
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VAlert',
-                                        'props': {
-                                            'type': 'info',
-                                            'variant': 'tonal',
-                                            # G3: 删除误导用户忽略 NoneType 错误的文案,
-                                            # 改为自动注册与排障说明
-                                            'text': '该方式通过 Jackett Torznab API 扩展检索，站点由插件自动注册到站点列表，'
-                                                    '并随定时任务与白名单配置自动同步新增、更新与移除。'
-                                                    '如遇网络或 API 错误，请查看日志确认 Jackett 地址、Api Key 与密码配置正确。'
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    }
-                ]
-            }
-        ], {
-            "enabled": False,
-            "proxy": False,
-            "host": "",
-            "api_key": "",
-            "password": "",
-            "cron": "0 0 * * *",
-            "timeout": self.SEARCH_TIMEOUT_DEFAULT,
-            # G1: 补齐 indexer_sites 默认键,与保存配置结构一致
-            "indexer_sites": []
-        }
+        return build_form(
+            site_options,
+            timeout_default=self.SEARCH_TIMEOUT_DEFAULT,
+            timeout_min=self.SEARCH_TIMEOUT_MIN,
+            timeout_max=self.SEARCH_TIMEOUT_MAX,
+        )
 
     def _ensure_sites_loaded(self) -> bool:
         """
@@ -1796,82 +1517,4 @@ class JackettExtend(_PluginBase):
 
         with self._state_lock:
             indexers = list(self._indexers) if isinstance(self._indexers, list) else []
-        items = []
-        for site in indexers:
-            items.append({
-                'component': 'tr',
-                'content': [
-                    {
-                        'component': 'td',
-                        'text': site.get("id")
-                    },
-                    {
-                        'component': 'td',
-                        # G3: 与 DB 中站点 url 格式一致(带尾斜杠)
-                        'text': f"https://{site.get('domain')}/"
-                    },
-                    {
-                        'component': 'td',
-                        'text': privacy_label(site.get("privacy"), site.get("public"))
-                    }
-                ]
-            })
-
-        return [
-            {
-                'component': 'VRow',
-                'content': [
-                    {
-                        'component': 'VCol',
-                        'props': {
-                            'cols': 12
-                        },
-                        'content': [
-                            {
-                                'component': 'VTable',
-                                'props': {
-                                    'hover': True
-                                },
-                                'content': [
-                                    {
-                                        'component': 'thead',
-                                        'content': [
-                                            {
-                                                'component': 'tr',
-                                                'content': [
-                                                    {
-                                                        'component': 'th',
-                                                        'props': {
-                                                            'class': 'text-start ps-4'
-                                                        },
-                                                        'text': 'id'
-                                                    },
-                                                    {
-                                                        'component': 'th',
-                                                        'props': {
-                                                            'class': 'text-start ps-4'
-                                                        },
-                                                        'text': '站点domain'
-                                                    },
-                                                    {
-                                                        'component': 'th',
-                                                        'props': {
-                                                            'class': 'text-start ps-4'
-                                                        },
-                                                        'text': '类型'
-                                                    }
-                                                ]
-                                            }
-                                        ]
-                                    },
-                                    {
-                                        'component': 'tbody',
-                                        'content': items
-                                    }
-                                ]
-                            }
-                        ]
-                    }
-                ]
-            }
-        ]
+        return build_page(indexers)

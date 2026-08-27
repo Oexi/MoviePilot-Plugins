@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import importlib.util
 import inspect
 import json
@@ -138,6 +139,110 @@ def loaded_module():
                 sys.modules.pop(name, None)
 
 
+@contextmanager
+def isolated_ui_module():
+    """Load the pure UI builder without installing MoviePilot shims."""
+    package_name = "jackettextend_ui_test"
+    module_name = f"{package_name}._ui"
+    previous_package = sys.modules.get(package_name)
+    previous_submodules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name.startswith(f"{package_name}.")
+    }
+    package = types.ModuleType(package_name)
+    package.__path__ = [str(PACKAGE_PATH)]
+    sys.modules[package_name] = package
+    try:
+        spec = importlib.util.spec_from_file_location(
+            module_name,
+            PACKAGE_PATH / "_ui.py",
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        yield module
+    finally:
+        for name in list(sys.modules):
+            if name.startswith(f"{package_name}."):
+                sys.modules.pop(name, None)
+        sys.modules.update(previous_submodules)
+        if previous_package is None:
+            sys.modules.pop(package_name, None)
+        else:
+            sys.modules[package_name] = previous_package
+
+
+@contextmanager
+def site_oper_modules(site_oper, eventmanager=None, event_type=None, fallback=False):
+    """Install isolated DB/event import shims for the real sync boundaries."""
+    names = [
+        "app",
+        "app.db",
+        "app.db.site_oper",
+        "app.db.oper",
+        "app.db.oper.site",
+        "app.sdk",
+        "app.sdk.events",
+        "app.schemas",
+        "app.schemas.types",
+    ]
+    previous = {name: sys.modules.get(name) for name in names}
+    previous_attrs = {}
+    for parent_name in ("app", "app.db", "app.db.oper", "app.sdk", "app.schemas"):
+        parent = sys.modules.get(parent_name)
+        if parent is not None:
+            previous_attrs[(parent_name, "__path__")] = getattr(parent, "__path__", None)
+
+    app = sys.modules.get("app") or types.ModuleType("app")
+    app.__path__ = []
+    db = types.ModuleType("app.db")
+    db.__path__ = []
+    sdk = sys.modules.get("app.sdk") or types.ModuleType("app.sdk")
+    sdk.__path__ = []
+    schemas = sys.modules.get("app.schemas") or types.ModuleType("app.schemas")
+    schemas.__path__ = []
+    sys.modules.update({"app": app, "app.db": db, "app.sdk": sdk, "app.schemas": schemas})
+
+    if fallback:
+        oper = types.ModuleType("app.db.oper")
+        oper.__path__ = []
+        site = types.ModuleType("app.db.oper.site")
+        site.SiteOper = site_oper
+        sys.modules.update({"app.db.oper": oper, "app.db.oper.site": site})
+    else:
+        primary = types.ModuleType("app.db.site_oper")
+        primary.SiteOper = site_oper
+        sys.modules["app.db.site_oper"] = primary
+
+    if eventmanager is not None:
+        events = types.ModuleType("app.sdk.events")
+        events.eventmanager = eventmanager
+        event_types = types.ModuleType("app.schemas.types")
+        event_types.EventType = event_type
+        sys.modules.update({"app.sdk.events": events, "app.schemas.types": event_types})
+
+    try:
+        yield
+    finally:
+        for name, previous_module in previous.items():
+            if previous_module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous_module
+        for (parent_name, attr), value in previous_attrs.items():
+            parent = sys.modules.get(parent_name)
+            if parent is None:
+                continue
+            if value is None:
+                try:
+                    delattr(parent, attr)
+                except AttributeError:
+                    pass
+            else:
+                setattr(parent, attr, value)
+
+
 class JackettV3ContractTest(unittest.TestCase):
     @staticmethod
     def _page_texts(page):
@@ -273,6 +378,118 @@ class JackettV3ContractTest(unittest.TestCase):
                 self.assertIn(label, texts)
             self.assertNotIn("True", texts)
             self.assertNotIn("False", texts)
+
+    def test_get_form_preserves_configuration_models_options_and_description(self):
+        with loaded_module() as module:
+            plugin = object.__new__(module.JackettExtend)
+            plugin.get_indexers = lambda filter_selected=False: [
+                {"name": "Nyaa", "indexer_id": "nyaa"},
+            ]
+
+            form, defaults = plugin.get_form()
+
+            self.assertEqual(defaults, {
+                "enabled": False,
+                "proxy": False,
+                "host": "",
+                "api_key": "",
+                "password": "",
+                "cron": "0 0 * * *",
+                "timeout": 30,
+                "indexer_sites": [],
+            })
+
+            fields = {}
+            alerts = []
+
+            def collect(node):
+                if isinstance(node, dict):
+                    props = node.get("props", {})
+                    model = props.get("model")
+                    if model:
+                        fields[model] = props
+                    if node.get("component") == "VAlert":
+                        alerts.append(props)
+                    for child in node.get("content", []):
+                        collect(child)
+                elif isinstance(node, list):
+                    for child in node:
+                        collect(child)
+
+            collect(form)
+            self.assertEqual(
+                set(fields),
+                {"enabled", "timeout", "proxy", "host", "api_key", "password", "cron", "indexer_sites"},
+            )
+            self.assertEqual(fields["enabled"]["label"], "启用插件")
+            self.assertEqual(fields["timeout"]["placeholder"], "30")
+            self.assertIn("范围 5-120 秒", fields["timeout"]["hint"])
+            self.assertEqual(fields["host"]["placeholder"], "http://127.0.0.1:9117")
+            self.assertEqual(fields["api_key"]["label"], "Api Key")
+            self.assertEqual(fields["password"]["type"], "password")
+            self.assertEqual(fields["cron"]["placeholder"], "0 0 * * *")
+            self.assertEqual(fields["indexer_sites"]["items"], [
+                {"title": "Nyaa (nyaa)", "value": "nyaa"},
+            ])
+            self.assertEqual(len(alerts), 1)
+            self.assertEqual(alerts[0]["type"], "info")
+            self.assertEqual(alerts[0]["variant"], "tonal")
+            self.assertEqual(
+                alerts[0]["text"],
+                "该方式通过 Jackett Torznab API 扩展检索，站点由插件自动注册到站点列表，"
+                "并随定时任务与白名单配置自动同步新增、更新与移除。"
+                "如遇网络或 API 错误，请查看日志确认 Jackett 地址、Api Key 与密码配置正确。",
+            )
+
+    def test_get_page_preserves_table_rows_and_empty_load_behavior(self):
+        with loaded_module() as module:
+            plugin = object.__new__(module.JackettExtend)
+            plugin._indexers = [{
+                "id": "JackettExtend-Nyaa",
+                "domain": "jackett_extend.nyaa",
+                "privacy": "semi-private",
+                "public": False,
+            }]
+
+            page = plugin.get_page()
+            table = page[0]["content"][0]["content"][0]
+            header = table["content"][0]["content"][0]["content"]
+            row = table["content"][1]["content"][0]
+            self.assertEqual([cell["text"] for cell in header], ["id", "站点domain", "类型"])
+            self.assertEqual(
+                [cell["text"] for cell in row["content"]],
+                ["JackettExtend-Nyaa", "https://jackett_extend.nyaa/", "半公开"],
+            )
+
+            plugin._ensure_sites_loaded = lambda: False
+            self.assertEqual(plugin.get_page(), [])
+
+    def test_ui_builders_are_host_independent_and_do_not_mutate_inputs(self):
+        with isolated_ui_module() as ui:
+            options = [{"title": "Nyaa (nyaa)", "value": "nyaa"}]
+            options_before = copy.deepcopy(options)
+            form, defaults = ui.build_form(options, timeout_default=30, timeout_min=5, timeout_max=120)
+
+            self.assertEqual(options, options_before)
+            self.assertEqual(defaults["timeout"], 30)
+            self.assertEqual(
+                form[0]["content"][2]["content"][2]["content"][0]["props"]["items"],
+                options_before,
+            )
+
+            indexers = [{
+                "id": "JackettExtend-Nyaa",
+                "domain": "jackett_extend.nyaa",
+                "privacy": "public",
+                "public": True,
+            }]
+            indexers_before = copy.deepcopy(indexers)
+            page = ui.build_page(indexers)
+            self.assertEqual(indexers, indexers_before)
+            self.assertEqual(
+                page[0]["content"][0]["content"][0]["content"][1]["content"][0]["content"][1]["text"],
+                "https://jackett_extend.nyaa/",
+            )
 
     def test_keyword_mask_does_not_retain_original_prefix(self):
         with loaded_module() as module:
@@ -964,6 +1181,394 @@ class JackettV3ContractTest(unittest.TestCase):
 
             self.assertEqual(registered, [])
             self.assertEqual(cleanup_snapshots, [])
+
+
+class JackettSyncBoundaryTest(unittest.TestCase):
+    @staticmethod
+    def _active_plugin(module, generation=1):
+        plugin = object.__new__(module.JackettExtend)
+        plugin._sync_stop_event = threading.Event()
+        plugin._sync_generation = generation
+        return plugin
+
+    @staticmethod
+    def _event_manager(fail=False, invalidate=None):
+        state = types.SimpleNamespace(calls=[])
+
+        class EventManager:
+            def send_event(self, event, payload):
+                state.calls.append((event, payload))
+                if invalidate is not None:
+                    invalidate()
+                if fail:
+                    raise RuntimeError("event unavailable")
+
+        return EventManager(), state
+
+    def test_register_site_adds_rows_and_supports_both_oper_import_paths(self):
+        for fallback in (False, True):
+            with self.subTest(fallback=fallback), loaded_module() as module:
+                state = types.SimpleNamespace(adds=[], updates=[], lookups=[])
+
+                class FakeSiteOper:
+                    def get_by_domain(self, domain):
+                        state.lookups.append(domain)
+                        return None
+
+                    def add(self, **payload):
+                        state.adds.append(payload)
+
+                    def update(self, site_id, payload):
+                        state.updates.append((site_id, payload))
+
+                eventmanager, events = self._event_manager()
+                event_type = types.SimpleNamespace(SiteUpdated="SiteUpdated")
+                plugin = self._active_plugin(module)
+                indexer = {
+                    "name": "Nyaa",
+                    "domain": "jackett_extend.nyaa",
+                    "public": True,
+                    "proxy": True,
+                }
+
+                with site_oper_modules(
+                    FakeSiteOper,
+                    eventmanager=eventmanager,
+                    event_type=event_type,
+                    fallback=fallback,
+                ):
+                    result = plugin._JackettExtend__register_site(indexer, generation=1)
+
+                self.assertTrue(result)
+                self.assertEqual(state.lookups, ["jackett_extend.nyaa"])
+                self.assertEqual(state.adds, [{
+                    "name": "Nyaa",
+                    "domain": "jackett_extend.nyaa",
+                    "url": "https://jackett_extend.nyaa/",
+                    "public": 1,
+                    "proxy": 1,
+                    "is_active": True,
+                    "pri": 1,
+                }])
+                self.assertEqual(state.updates, [])
+                self.assertEqual(
+                    events.calls,
+                    [("SiteUpdated", {"domain": "jackett_extend.nyaa"})],
+                )
+
+    def test_register_site_updates_only_plugin_owned_fields(self):
+        with loaded_module() as module:
+            existing = types.SimpleNamespace(
+                id=41,
+                domain="jackett_extend.nyaa",
+                is_active=False,
+                pri=99,
+                proxy=1,
+                custom_flag="keep",
+            )
+            state = types.SimpleNamespace(updates=[])
+
+            class FakeSiteOper:
+                def get_by_domain(self, domain):
+                    self.lookup = domain
+                    return existing
+
+                def update(self, site_id, payload):
+                    state.updates.append((site_id, payload))
+
+                def add(self, **_payload):
+                    raise AssertionError("existing rows must not use add")
+
+            eventmanager, events = self._event_manager()
+            event_type = types.SimpleNamespace(SiteUpdated="SiteUpdated")
+            plugin = self._active_plugin(module)
+            indexer = {
+                "name": "Nyaa renamed",
+                "domain": "jackett_extend.nyaa",
+                "public": False,
+                "proxy": False,
+            }
+
+            with site_oper_modules(
+                FakeSiteOper,
+                eventmanager=eventmanager,
+                event_type=event_type,
+                fallback=True,
+            ):
+                result = plugin._JackettExtend__register_site(indexer, generation=1)
+
+            self.assertTrue(result)
+            self.assertEqual(
+                state.updates,
+                [(41, {
+                    "name": "Nyaa renamed",
+                    "url": "https://jackett_extend.nyaa/",
+                    "public": 0,
+                })],
+            )
+            self.assertEqual(existing.is_active, False)
+            self.assertEqual(existing.pri, 99)
+            self.assertEqual(existing.proxy, 1)
+            self.assertEqual(existing.custom_flag, "keep")
+            self.assertEqual(
+                events.calls,
+                [("SiteUpdated", {"domain": "jackett_extend.nyaa"})],
+            )
+
+    def test_register_site_add_conflict_rechecks_and_updates(self):
+        with loaded_module() as module:
+            existing = types.SimpleNamespace(id=7, domain="jackett_extend.nyaa")
+            state = types.SimpleNamespace(adds=[], lookups=[], updates=[])
+
+            class FakeSiteOper:
+                def get_by_domain(self, domain):
+                    state.lookups.append(domain)
+                    return None if len(state.lookups) == 1 else existing
+
+                def add(self, **payload):
+                    state.adds.append(payload)
+                    raise RuntimeError("duplicate")
+
+                def update(self, site_id, payload):
+                    state.updates.append((site_id, payload))
+
+            eventmanager, events = self._event_manager()
+            event_type = types.SimpleNamespace(SiteUpdated="SiteUpdated")
+            plugin = self._active_plugin(module)
+
+            with site_oper_modules(
+                FakeSiteOper,
+                eventmanager=eventmanager,
+                event_type=event_type,
+            ):
+                result = plugin._JackettExtend__register_site({
+                    "name": "Nyaa",
+                    "domain": "jackett_extend.nyaa",
+                    "public": True,
+                    "proxy": False,
+                }, generation=1)
+
+            self.assertTrue(result)
+            self.assertEqual(len(state.adds), 1)
+            self.assertEqual(
+                state.updates,
+                [(7, {
+                    "name": "Nyaa",
+                    "url": "https://jackett_extend.nyaa/",
+                    "public": 1,
+                })],
+            )
+            self.assertEqual(state.lookups, ["jackett_extend.nyaa", "jackett_extend.nyaa"])
+            self.assertEqual(
+                events.calls,
+                [("SiteUpdated", {"domain": "jackett_extend.nyaa"})],
+            )
+
+    def test_register_site_event_failure_reports_false_after_db_success(self):
+        with loaded_module() as module:
+            state = types.SimpleNamespace(adds=[])
+
+            class FakeSiteOper:
+                def get_by_domain(self, _domain):
+                    return None
+
+                def add(self, **payload):
+                    state.adds.append(payload)
+
+            eventmanager, events = self._event_manager(fail=True)
+            event_type = types.SimpleNamespace(SiteUpdated="SiteUpdated")
+            plugin = self._active_plugin(module)
+
+            with site_oper_modules(
+                FakeSiteOper,
+                eventmanager=eventmanager,
+                event_type=event_type,
+            ):
+                result = plugin._JackettExtend__register_site({
+                    "name": "Nyaa",
+                    "domain": "jackett_extend.nyaa",
+                    "public": True,
+                }, generation=1)
+
+            self.assertFalse(result)
+            self.assertEqual(len(state.adds), 1)
+            self.assertEqual(
+                events.calls,
+                [("SiteUpdated", {"domain": "jackett_extend.nyaa"})],
+            )
+
+    def test_remove_stale_sites_deletes_only_virtual_rows_and_emits_deleted(self):
+        with loaded_module() as module:
+            records = [
+                types.SimpleNamespace(id=1, domain="jackett_extend.old"),
+                types.SimpleNamespace(id=2, domain="ordinary.example"),
+                types.SimpleNamespace(id=3, domain="jackett_extend.keep"),
+            ]
+            state = types.SimpleNamespace(deleted=[])
+
+            class FakeSiteOper:
+                def list(self):
+                    return records
+
+                def delete(self, site_id):
+                    state.deleted.append(site_id)
+
+            eventmanager, events = self._event_manager()
+            event_type = types.SimpleNamespace(SiteDeleted="SiteDeleted")
+            plugin = self._active_plugin(module)
+            plugin._sync_ready = True
+
+            with site_oper_modules(
+                FakeSiteOper,
+                eventmanager=eventmanager,
+                event_type=event_type,
+            ):
+                result = plugin._JackettExtend__sync_remove_stale_sites(
+                    [{"domain": "jackett_extend.keep"}],
+                    generation=1,
+                )
+
+            self.assertTrue(result)
+            self.assertEqual(state.deleted, [1])
+            self.assertEqual(
+                events.calls,
+                [("SiteDeleted", {"site_id": 1})],
+            )
+
+    def test_remove_stale_sites_event_failure_makes_stage_fail(self):
+        with loaded_module() as module:
+            state = types.SimpleNamespace(deleted=[])
+
+            class FakeSiteOper:
+                def list(self):
+                    return [types.SimpleNamespace(id=1, domain="jackett_extend.old")]
+
+                def delete(self, site_id):
+                    state.deleted.append(site_id)
+
+            eventmanager, events = self._event_manager(fail=True)
+            event_type = types.SimpleNamespace(SiteDeleted="SiteDeleted")
+            plugin = self._active_plugin(module)
+            plugin._sync_ready = True
+
+            with site_oper_modules(
+                FakeSiteOper,
+                eventmanager=eventmanager,
+                event_type=event_type,
+            ):
+                result = plugin._JackettExtend__sync_remove_stale_sites(
+                    [{"domain": "jackett_extend.keep"}],
+                    generation=1,
+                )
+
+            self.assertFalse(result)
+            self.assertEqual(state.deleted, [1])
+            self.assertEqual(
+                events.calls,
+                [("SiteDeleted", {"site_id": 1})],
+            )
+
+    def test_remove_stale_sites_stops_after_generation_invalidates(self):
+        with loaded_module() as module:
+            state = types.SimpleNamespace(deleted=[])
+            plugin = self._active_plugin(module)
+
+            class FakeSiteOper:
+                def list(self):
+                    return [
+                        types.SimpleNamespace(id=1, domain="jackett_extend.first"),
+                        types.SimpleNamespace(id=2, domain="jackett_extend.second"),
+                    ]
+
+                def delete(self, site_id):
+                    state.deleted.append(site_id)
+                    with plugin._state_lock:
+                        plugin._sync_generation += 1
+
+            eventmanager, events = self._event_manager()
+            event_type = types.SimpleNamespace(SiteDeleted="SiteDeleted")
+            plugin._sync_ready = True
+
+            with site_oper_modules(
+                FakeSiteOper,
+                eventmanager=eventmanager,
+                event_type=event_type,
+            ):
+                result = plugin._JackettExtend__sync_remove_stale_sites(
+                    [{"domain": "jackett_extend.keep"}],
+                    generation=1,
+                )
+
+            self.assertFalse(result)
+            self.assertEqual(state.deleted, [1])
+            self.assertEqual(
+                events.calls,
+                [("SiteDeleted", {"site_id": 1})],
+            )
+
+    def test_reload_uses_real_stop_and_replaces_generation_event(self):
+        with loaded_module() as module:
+            class FakeCronTrigger:
+                @classmethod
+                def from_crontab(cls, expression, timezone=None):
+                    return cls()
+
+            created = []
+
+            class FakeThread:
+                def __init__(self, target, kwargs, name, daemon):
+                    self.target = target
+                    self.kwargs = kwargs
+                    self.name = name
+                    self.daemon = daemon
+                    self.started = False
+                    created.append(self)
+
+                def start(self):
+                    self.started = True
+
+                def is_alive(self):
+                    return False
+
+                def join(self, timeout=None):
+                    return None
+
+            module.CronTrigger = FakeCronTrigger
+            module.threading = types.SimpleNamespace(
+                Event=threading.Event,
+                Thread=FakeThread,
+                current_thread=threading.current_thread,
+            )
+            plugin = object.__new__(module.JackettExtend)
+
+            plugin.init_plugin({
+                "enabled": True,
+                "host": "https://first.invalid",
+                "api_key": "first-key",
+            })
+            first_event = plugin._sync_stop_event
+            first_generation = plugin._sync_generation
+            self.assertEqual(len(created), 1)
+            self.assertTrue(created[0].started)
+            self.assertEqual(created[0].kwargs, {"generation": first_generation})
+
+            plugin.init_plugin({
+                "enabled": True,
+                "host": "https://second.invalid",
+                "api_key": "second-key",
+            })
+            second_event = plugin._sync_stop_event
+            second_generation = plugin._sync_generation
+
+            self.assertTrue(first_event.is_set())
+            self.assertIsNot(first_event, second_event)
+            self.assertGreaterEqual(second_generation, first_generation + 2)
+            self.assertEqual(len(created), 2)
+            self.assertTrue(created[1].started)
+            self.assertEqual(created[1].kwargs, {"generation": second_generation})
+
+            plugin.stop_service()
+            self.assertTrue(second_event.is_set())
 
 
 if __name__ == "__main__":

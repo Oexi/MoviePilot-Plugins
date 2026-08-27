@@ -1,5 +1,6 @@
 import importlib.util
 import unittest
+import xml.dom.minidom
 import xml.etree.ElementTree as ElementTree
 from pathlib import Path
 
@@ -116,6 +117,141 @@ class TorznabEnclosureTest(unittest.TestCase):
         self.assertIn("token=", redacted)
         self.assertIn("password=", redacted)
         self.assertIn("cat=3000", redacted)
+
+
+class TorznabPureParsingTest(unittest.TestCase):
+    def test_safe_numeric_helpers_keep_parser_fallbacks(self):
+        self.assertEqual(MODULE.safe_int("-3"), -3)
+        self.assertEqual(MODULE.safe_int("bad"), 0)
+        self.assertEqual(MODULE.safe_float("1.5"), 1.5)
+        self.assertEqual(MODULE.safe_float("-1"), 0.0)
+        self.assertEqual(MODULE.safe_float("nan"), 0.0)
+        self.assertEqual(MODULE.safe_count("4"), 4)
+        self.assertEqual(MODULE.safe_count("-4"), 0)
+        self.assertEqual(MODULE.safe_float_none("0"), 0.0)
+        self.assertIsNone(MODULE.safe_float_none("inf"))
+        self.assertIsNone(MODULE.safe_float_none("invalid"))
+
+    def test_normalize_imdb_id_rejects_non_identity_values(self):
+        self.assertEqual(MODULE.normalize_imdbid(" TT1234567 "), "tt1234567")
+        self.assertEqual(MODULE.normalize_imdbid("tt12345678901234567890"),
+                         "tt12345678901234567890")
+        self.assertEqual(MODULE.normalize_imdbid("tt0000000"), "")
+        self.assertEqual(MODULE.normalize_imdbid("nm1234567"), "")
+
+    def test_extract_item_fields_and_torznab_attrs_without_host_imports(self):
+        item = xml.dom.minidom.parseString("""
+            <item>
+              <title>Fixture title</title>
+              <enclosure url="https://jackett.invalid/dl.torrent" />
+              <link>https://jackett.invalid/detail</link>
+              <guid>guid-value</guid>
+              <description>description</description>
+              <size>123.5</size>
+              <comments>https://jackett.invalid/comments</comments>
+              <pubDate>Wed, 01 Jan 2025 00:00:00 GMT</pubDate>
+              <torznab:attr xmlns:torznab="http://torznab.com/schemas/2015/feed"
+                            name="seeders" value="12" />
+              <torznab:attr xmlns:torznab="http://torznab.com/schemas/2015/feed"
+                            name="peers" value="3" />
+              <torznab:attr xmlns:torznab="http://torznab.com/schemas/2015/feed"
+                            name="grabs" value="7" />
+              <torznab:attr xmlns:torznab="http://torznab.com/schemas/2015/feed"
+                            name="imdbid" value=" TT1234567 " />
+              <torznab:attr xmlns:torznab="http://torznab.com/schemas/2015/feed"
+                            name="infohash" value=" ABC " />
+              <torznab:attr xmlns:torznab="http://torznab.com/schemas/2015/feed"
+                            name="magneturl" value="magnet:?xt=urn:btih:abc" />
+              <torznab:attr xmlns:torznab="http://torznab.com/schemas/2015/feed"
+                            name="uploadvolumefactor" value="2.5" />
+              <torznab:attr xmlns:torznab="http://torznab.com/schemas/2015/feed"
+                            name="downloadvolumefactor" value="0" />
+              <torznab:attr xmlns:torznab="http://torznab.com/schemas/2015/feed"
+                            name="hit_and_run" value="YES" />
+              <torznab:attr xmlns:torznab="http://torznab.com/schemas/2015/feed"
+                            name="label" value="trusted" />
+              <torznab:attr xmlns:torznab="http://torznab.com/schemas/2015/feed"
+                            name="tag" value="trusted" />
+              <torznab:attr xmlns:torznab="http://torznab.com/schemas/2015/feed"
+                            name="tag" value="scene" />
+            </item>
+        """).documentElement
+
+        fields = MODULE.extract_torznab_item(item)
+
+        self.assertEqual(fields["title"], "Fixture title")
+        self.assertEqual(fields["enclosure"], "https://jackett.invalid/dl.torrent")
+        self.assertEqual(fields["link"], "https://jackett.invalid/detail")
+        self.assertEqual(fields["guid"], "guid-value")
+        self.assertEqual(fields["description"], "description")
+        self.assertEqual(fields["size"], "123.5")
+        self.assertEqual(fields["page_url"], "https://jackett.invalid/comments")
+        self.assertEqual(fields["pubdate"], "Wed, 01 Jan 2025 00:00:00 GMT")
+        self.assertEqual(fields["seeders"], "12")
+        self.assertEqual(fields["peers"], "3")
+        self.assertEqual(fields["grabs"], "7")
+        self.assertEqual(fields["imdbid"], "tt1234567")
+        self.assertEqual(fields["infohash"], "ABC")
+        self.assertEqual(fields["magnet_url"], "magnet:?xt=urn:btih:abc")
+        self.assertEqual(fields["uploadvolumefactor"], "2.5")
+        self.assertEqual(fields["downloadvolumefactor"], "0")
+        self.assertTrue(fields["hit_and_run"])
+        self.assertEqual(fields["labels"], ["trusted", "scene"])
+
+    def test_extract_item_uses_first_child_data_for_cdata_fields(self):
+        item = xml.dom.minidom.parseString("""
+            <item>
+              <title><![CDATA[first title]]>ignored trailing text</title>
+              <description><![CDATA[first description]]>ignored trailing text</description>
+            </item>
+        """).documentElement
+
+        fields = MODULE.extract_torznab_item(item)
+
+        self.assertEqual(fields["title"], "first title")
+        self.assertEqual(fields["description"], "first description")
+
+    def test_extract_item_keeps_valid_item_when_optional_tag_is_empty(self):
+        item = xml.dom.minidom.parseString("""
+            <item>
+              <title>valid title</title>
+              <enclosure url="https://jackett.invalid/valid.torrent" />
+              <description />
+              <comments />
+            </item>
+        """).documentElement
+
+        fields = MODULE.extract_torznab_item(item)
+
+        self.assertEqual(fields["title"], "valid title")
+        self.assertEqual(fields["enclosure"], "https://jackett.invalid/valid.torrent")
+        self.assertEqual(fields["description"], "")
+        self.assertEqual(fields["page_url"], "")
+
+    def test_primary_identity_order_and_http_duplicate_preference(self):
+        self.assertEqual(
+            MODULE.select_torznab_identity("Hash", "Guid", "Page", "URL"),
+            ("infohash", "hash"),
+        )
+        self.assertEqual(
+            MODULE.select_torznab_identity("", "Guid", "Page", "URL"),
+            ("guid", "guid"),
+        )
+        self.assertEqual(
+            MODULE.select_torznab_identity("", "", "Page", "URL"),
+            ("page_url", "page"),
+        )
+        self.assertEqual(
+            MODULE.select_torznab_identity("", "", "", "URL"),
+            ("enclosure", "url"),
+        )
+        magnet = "magnet:?xt=urn:btih:fixture"
+        direct = "https://jackett.invalid/dl/fixture.torrent"
+        self.assertTrue(MODULE.is_http_torznab_url(direct))
+        self.assertFalse(MODULE.is_http_torznab_url(magnet))
+        self.assertTrue(MODULE.should_replace_torznab_duplicate(magnet, direct))
+        self.assertFalse(MODULE.should_replace_torznab_duplicate(direct, magnet))
+        self.assertFalse(MODULE.should_replace_torznab_duplicate(magnet, magnet))
 
 
 if __name__ == "__main__":

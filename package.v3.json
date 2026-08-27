@@ -3,11 +3,12 @@
     "name": "JackettExtend",
     "description": "扩展检索以支持Jackett站点资源",
     "labels": "索引器,Jackett",
-    "version": "3.2.12",
+    "version": "3.2.13",
     "icon": "Jackett_A.png",
     "author": "jtcymc",
     "level": 1,
     "history": {
+      "v3.2.13": "完成 UI 与 Torznab 纯逻辑模块化，并补齐站点同步边界保护测试",
       "v3.2.12": "隔离同步、搜索与连接探测诊断状态，避免错误信息相互覆盖",
       "v3.2.11": "将 Jackett 更新周期接入 MoviePilot 公共定时服务列表，移除插件自建调度器并避免任务重复执行",
       "v3.2.10": "修复 IMDb 身份值校验及 Torznab 数值字段的非有限值和负值边界",
