@@ -484,6 +484,91 @@ class JackettV3ContractTest(unittest.TestCase):
             self.assertNotIn("host", payload)
             self.assertEqual(payload["last_error"], "timeout")
 
+    def test_probe_failure_keeps_sync_error_and_reports_local_probe_error(self):
+        with loaded_module() as module:
+            plugin = object.__new__(module.JackettExtend)
+            plugin._host = ""
+            plugin._api_key = ""
+            plugin._password = ""
+            plugin._enabled = True
+            plugin._last_error = "sync_timeout"
+            plugin._last_error_at = 11
+            plugin._indexers = []
+            plugin._authoritative_indexers = []
+            plugin._fetch_ok = True
+            plugin._sync_ready = True
+            plugin._last_sync_ok = True
+            plugin._last_sync_at = 10
+
+            payload = plugin.api_test()
+
+            self.assertFalse(payload["ok"])
+            self.assertFalse(payload["connected"])
+            self.assertEqual(payload["last_error"], "sync_timeout")
+            self.assertEqual(payload["last_error_at"], 11)
+            self.assertEqual(payload["probe_error"], "missing_config")
+            self.assertIsNotNone(payload["probe_error_at"])
+
+    def test_probe_success_keeps_sync_error_and_reports_success(self):
+        with loaded_module() as module:
+            plugin = object.__new__(module.JackettExtend)
+            plugin._host = "https://jackett.invalid"
+            plugin._api_key = "key"
+            plugin._password = ""
+            plugin._enabled = True
+            plugin._last_error = "sync_timeout"
+            plugin._last_error_at = 11
+            plugin._indexers = []
+            plugin._authoritative_indexers = []
+            plugin._fetch_ok = False
+            plugin._sync_ready = False
+            plugin._last_sync_ok = False
+            plugin._last_sync_at = 10
+
+            def fetch_probe(**_kwargs):
+                return [{"indexer_id": "nyaa", "domain": "jackett_extend.nyaa"}]
+
+            plugin._JackettExtend__fetch_indexers = fetch_probe
+            payload = plugin.api_test()
+
+            self.assertTrue(payload["ok"])
+            self.assertTrue(payload["connected"])
+            self.assertEqual(payload["last_error"], "sync_timeout")
+            self.assertEqual(payload["last_error_at"], 11)
+            self.assertIsNone(payload["probe_error"])
+            self.assertIsNone(payload["probe_error_at"])
+
+    def test_search_error_isolated_from_sync_error_and_exposed_in_status(self):
+        with loaded_module() as module:
+            _RequestUtils.response = _Response()
+            _RequestUtils.response.text = (
+                '<?xml version="1.0"?><error code="100" '
+                'description="secret diagnostic"/>'
+            )
+            plugin = object.__new__(module.JackettExtend)
+            plugin._host = "https://jackett.invalid"
+            plugin._api_key = "key"
+            plugin._timeout = 12
+            plugin._proxy = False
+            plugin._last_error = "sync_timeout"
+            plugin._last_error_at = 11
+            plugin._state_lock = module.JackettExtend._state_lock
+
+            result = plugin._JackettExtend__parse_torznab_xml(
+                "https://jackett.invalid/results?q=secret&apikey=key",
+            )
+            payload = plugin.api_status()
+
+            self.assertEqual(result, [])
+            self.assertEqual(plugin._last_error, "sync_timeout")
+            self.assertEqual(plugin._last_search_error, "torznab_error")
+            self.assertEqual(payload["last_error"], "sync_timeout")
+            self.assertEqual(payload["last_search_error"], "torznab_error")
+            rendered = repr(payload)
+            self.assertNotIn("secret", rendered)
+            self.assertNotIn("diagnostic", rendered)
+            self.assertNotIn("key", rendered)
+
     def test_parser_populates_v3_context_and_deduplicates_per_site(self):
         with loaded_module() as module:
             _RequestUtils.response = _Response()
@@ -743,7 +828,7 @@ class JackettV3ContractTest(unittest.TestCase):
                 "https://jackett.invalid/results?q=private-title&apikey=secret",
             )
             self.assertEqual(result, [])
-            self.assertEqual(plugin._last_error, "torznab_error")
+            self.assertEqual(plugin._last_search_error, "torznab_error")
             rendered_logs = " ".join(logs)
             self.assertNotIn("description", rendered_logs)
             self.assertNotIn("secret diagnostic", rendered_logs)

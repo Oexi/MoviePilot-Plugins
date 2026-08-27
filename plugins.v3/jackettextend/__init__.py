@@ -83,7 +83,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.2.11"
+    plugin_version = "3.2.12"
     # 插件作者
     plugin_author = "jtcymc"
     # 作者主页
@@ -126,6 +126,8 @@ class JackettExtend(_PluginBase):
     _last_sync_at = 0.0
     _last_error = None
     _last_error_at = 0.0
+    _last_search_error = None
+    _last_search_error_at = 0.0
     sites_helper = None
     # 仅用于标识，避免重复注册
     jackett_domain = "jackett_extend.jtcymc"
@@ -182,6 +184,8 @@ class JackettExtend(_PluginBase):
                 self._indexers_cache_ts = 0.0
                 self._last_error = None
                 self._last_error_at = 0.0
+                self._last_search_error = None
+                self._last_search_error_at = 0.0
 
                 # A fresh generation makes old scheduler callbacks harmless
                 # even if a host cannot cancel a callback already queued.
@@ -346,21 +350,37 @@ class JackettExtend(_PluginBase):
             and (generation is None or generation == current)
         )
 
-    def _record_error(self, category: str, generation: Optional[int] = None):
-        """Remember only a bounded, non-sensitive diagnostic category."""
+    @staticmethod
+    def _safe_error_category(category: str) -> str:
+        """Normalize a diagnostic category without retaining sensitive text."""
         safe = re.sub(r"[^a-z0-9_.-]", "_", str(category or "error").lower())[:64]
-        with self._state_lock:
-            if generation is not None and not self._sync_is_current(generation):
-                return
-            self._last_error = safe or "error"
-            self._last_error_at = time.time()
+        return safe or "error"
 
-    def _clear_error(self, generation: Optional[int] = None):
+    def _record_error(self, category: str, generation: Optional[int] = None,
+                      source: str = "sync"):
+        """Remember only a bounded, non-sensitive diagnostic category."""
+        safe = self._safe_error_category(category)
         with self._state_lock:
             if generation is not None and not self._sync_is_current(generation):
                 return
-            self._last_error = None
-            self._last_error_at = 0.0
+            now = time.time()
+            if source == "search":
+                self._last_search_error = safe
+                self._last_search_error_at = now
+            else:
+                self._last_error = safe
+                self._last_error_at = now
+
+    def _clear_error(self, generation: Optional[int] = None, source: str = "sync"):
+        with self._state_lock:
+            if generation is not None and not self._sync_is_current(generation):
+                return
+            if source == "search":
+                self._last_search_error = None
+                self._last_search_error_at = 0.0
+            else:
+                self._last_error = None
+                self._last_error_at = 0.0
 
     def __sync_remove_stale_sites(self, indexers_snapshot: Optional[list] = None,
                                   generation: Optional[int] = None):
@@ -904,6 +924,7 @@ class JackettExtend(_PluginBase):
 
         except Exception as e:
             # D8: 异常日志附带 URL/站点/关键词(脱敏)/异常类型
+            self._record_error("search_error", source="search")
             logger.error(
                 f"【{self.plugin_name}】检索出错：site={site.get('name')}, indexer={indexer_id}, "
                 f"url={redact_url(api_url) if api_url else '-'}, 关键词={masked_keyword or '-'}, "
@@ -994,11 +1015,19 @@ class JackettExtend(_PluginBase):
         return self._apply_indexer_selection(raw)
 
     def __fetch_indexers(self, config_snapshot: Optional[dict] = None,
-                         generation: Optional[int] = None):
+                         generation: Optional[int] = None,
+                         error_sink=None):
         """
         实时从 Jackett 拉取并构造 indexer 列表（完整列表,不过滤白名单）。
         :return: 成功返回 list(可能为空);失败返回 None
         """
+        def record_fetch_error(category: str):
+            """Record sync failures or send them to a caller-local probe sink."""
+            if callable(error_sink):
+                error_sink(self._safe_error_category(category))
+            else:
+                self._record_error(category, generation=generation)
+
         snapshot = dict(config_snapshot or self._config_for_sync())
         host = str(snapshot.get("host") or "").rstrip("/")
         api_key = str(snapshot.get("api_key") or "")
@@ -1006,7 +1035,7 @@ class JackettExtend(_PluginBase):
         proxy = bool(snapshot.get("proxy"))
         timeout = self._normalize_timeout(snapshot.get("timeout"))
         if not host or not api_key:
-            self._record_error("missing_config", generation=generation)
+            record_fetch_error("missing_config")
             return None
         headers = {
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
@@ -1028,7 +1057,7 @@ class JackettExtend(_PluginBase):
                         proxies=settings.PROXY if proxy else None
                     )
                 except Exception as e:
-                    self._record_error("login_error", generation=generation)
+                    record_fetch_error("login_error")
                     logger.warning(f"【{self.plugin_name}】Jackett 登录请求异常：{type(e).__name__}")
                     login_res = None
                 if login_res is not None and session.cookies:
@@ -1044,32 +1073,32 @@ class JackettExtend(_PluginBase):
 
             # E3: 校验状态码/Content-Type/数据类型,json 只解析一次
             if ret is None:
-                self._record_error("empty", generation=generation)
+                record_fetch_error("empty")
                 logger.warning(f"【{self.plugin_name}】拉取 indexers 请求失败：{redact_url(indexer_query_url)}")
                 return None
             if ret.status_code != 200:
-                self._record_error(f"http_{ret.status_code}", generation=generation)
+                record_fetch_error(f"http_{ret.status_code}")
                 logger.warning(f"【{self.plugin_name}】拉取 indexers 失败,HTTP {ret.status_code}：{redact_url(indexer_query_url)}")
                 return None
             content_type = (ret.headers.get("Content-Type") or "").lower()
             if "json" not in content_type:
-                self._record_error("content_type", generation=generation)
+                record_fetch_error("content_type")
                 logger.warning(f"【{self.plugin_name}】拉取 indexers 响应非 JSON(Content-Type={content_type!r})")
                 return None
             try:
                 raw_indexers = ret.json()
             except ValueError as e:
-                self._record_error("json_error", generation=generation)
+                record_fetch_error("json_error")
                 logger.warning(f"【{self.plugin_name}】拉取 indexers JSON 解析失败：{type(e).__name__}")
                 return None
             if not isinstance(raw_indexers, list):
-                self._record_error("json_type", generation=generation)
+                record_fetch_error("json_type")
                 logger.warning(
                     f"【{self.plugin_name}】拉取 indexers 响应类型异常"
                     f"(期望 list,实际 {type(raw_indexers).__name__})")
                 return None
         except Exception as e:
-            self._record_error("request_error", generation=generation)
+            record_fetch_error("request_error")
             logger.error(f"【{self.plugin_name}】获取 Jackett indexers 失败：{type(e).__name__}")
             return None
         finally:
@@ -1151,17 +1180,30 @@ class JackettExtend(_PluginBase):
     def _diagnostic_payload(self, probe: bool = False) -> Dict[str, Any]:
         """Build a read-only status payload containing no credentials."""
         connected = False
+        probe_error = None
+        probe_error_at = None
         if probe:
+            probe_state = {"error": None, "error_at": None}
+
+            def record_probe_error(category):
+                probe_state["error"] = self._safe_error_category(category)
+                probe_state["error_at"] = time.time()
+
             try:
                 # A test request performs only a fresh Jackett read.  It does
                 # not replace the authoritative sync snapshot or mutate DB
                 # sites while a background synchronization may be running.
-                probe_indexers = self.__fetch_indexers()
+                probe_indexers = self.__fetch_indexers(error_sink=record_probe_error)
                 connected = isinstance(probe_indexers, list) and bool(probe_indexers)
-                if connected:
-                    self._clear_error()
             except Exception:
-                self._record_error("status_error")
+                record_probe_error("status_error")
+            probe_error = probe_state["error"]
+            probe_error_at = probe_state["error_at"]
+            if connected:
+                # A successful probe has no local error to report.  It must
+                # not clear the last synchronization or search diagnostic.
+                probe_error = None
+                probe_error_at = None
         with self._state_lock:
             authoritative = self._authoritative_indexers
             selected = self._indexers
@@ -1171,6 +1213,8 @@ class JackettExtend(_PluginBase):
             last_sync_at = self._last_sync_at
             last_error = self._last_error
             last_error_at = self._last_error_at
+            last_search_error = getattr(self, "_last_search_error", None)
+            last_search_error_at = getattr(self, "_last_search_error_at", 0.0)
         if not probe:
             connected = fetch_ok and isinstance(authoritative, list) and bool(authoritative)
         # Host/API key/password/cookies are intentionally not represented.
@@ -1190,6 +1234,10 @@ class JackettExtend(_PluginBase):
             "selected_count": len(selected) if isinstance(selected, list) else 0,
             "last_error": last_error,
             "last_error_at": last_error_at or None,
+            "last_search_error": last_search_error,
+            "last_search_error_at": last_search_error_at or None,
+            "probe_error": probe_error,
+            "probe_error_at": probe_error_at or None,
         }
 
     def api_test(self) -> Dict[str, Any]:
@@ -1279,16 +1327,16 @@ class JackettExtend(_PluginBase):
                 url, proxies=settings.PROXY if request_proxy else None
             )
         except (requests.Timeout, TimeoutError):
-            self._record_error("timeout")
+            self._record_error("timeout", source="search")
             logger.warning(f"【{self.plugin_name}】torznab 响应超时：url={log_url}")
             return []
         except Exception as e:
             # requests 异常文本可能回显带 apikey 的原始 URL，仅记录异常类型。
-            self._record_error("request_error")
+            self._record_error("request_error", source="search")
             logger.error(f"【{self.plugin_name}】torznab 请求异常：url={log_url}, 类型={type(e).__name__}")
             return []
         if ret is None:
-            self._record_error("empty")
+            self._record_error("empty", source="search")
             logger.debug(f"【{self.plugin_name}】torznab 空响应：url={log_url}")
             return []
 
@@ -1297,9 +1345,9 @@ class JackettExtend(_PluginBase):
         response_category = classify_torznab_response(ret.status_code, content_type, ret.text)
         if response_category != "ok":
             if response_category == "http_error":
-                self._record_error(f"http_{ret.status_code}")
+                self._record_error(f"http_{ret.status_code}", source="search")
             else:
-                self._record_error(response_category)
+                self._record_error(response_category, source="search")
             logger.warning(
                 f"【{self.plugin_name}】Jackett torznab 响应不可用："
                 f"url={log_url}, category={response_category}, HTTP={ret.status_code}, "
@@ -1309,18 +1357,18 @@ class JackettExtend(_PluginBase):
 
         body = ret.text
         if not isinstance(body, str) or not body.strip():
-            self._record_error("empty")
+            self._record_error("empty", source="search")
             logger.debug(f"【{self.plugin_name}】torznab 空响应：url={log_url}")
             return []
         # Keep minidom bounded and reject DTD/entity declarations before the
         # parser sees them.  Normal Torznab RSS is small and has no DOCTYPE;
         # oversized/adversarial payloads are treated as an invalid response.
         if len(body.encode("utf-8", errors="ignore")) > self.TORZNAB_MAX_XML_BYTES:
-            self._record_error("xml_too_large")
+            self._record_error("xml_too_large", source="search")
             logger.warning(f"【{self.plugin_name}】torznab XML 超出大小限制：url={log_url}")
             return []
         if re.search(r"<!DOCTYPE\b", body, flags=re.IGNORECASE):
-            self._record_error("xml_doctype")
+            self._record_error("xml_doctype", source="search")
             logger.warning(f"【{self.plugin_name}】torznab XML 含不支持的 DOCTYPE：url={log_url}")
             return []
 
@@ -1337,17 +1385,17 @@ class JackettExtend(_PluginBase):
             root_node = dom_tree.documentElement
             root_name = getattr(root_node, "localName", None) or root_node.tagName.rsplit(":", 1)[-1]
             if root_name.lower() == "error":
-                self._record_error("torznab_error")
+                self._record_error("torznab_error", source="search")
                 logger.warning(f"【{self.plugin_name}】torznab 返回错误 XML")
                 return []
             items = root_node.getElementsByTagName("item")
             if len(items) > self.TORZNAB_MAX_ITEMS:
-                self._record_error("xml_too_many_items")
+                self._record_error("xml_too_many_items", source="search")
                 logger.warning(f"【{self.plugin_name}】torznab XML item 数量超出限制：url={log_url}")
                 return []
         except Exception as e:
             # F1: XML 解析失败降为 WARNING,不输出完整 traceback 刷屏
-            self._record_error("xml_error")
+            self._record_error("xml_error", source="search")
             logger.warning(f"【{self.plugin_name}】torznab XML 解析失败：url={log_url}, 类型={type(e).__name__}")
             return []
 
