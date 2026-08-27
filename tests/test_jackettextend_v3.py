@@ -180,6 +180,53 @@ class JackettV3ContractTest(unittest.TestCase):
             self.assertTrue(inspect.iscoroutinefunction(module.JackettExtend.async_search_torrents))
             self.assertTrue(inspect.iscoroutinefunction(module.JackettExtend.get_module(plugin)["async_search_torrents"]))
 
+    def test_get_service_exposes_shared_scheduler_contract(self):
+        with loaded_module() as module:
+            class FakeCronTrigger:
+                def __init__(self, expression, timezone=None):
+                    self.expression = expression
+                    self.timezone = timezone
+
+                @classmethod
+                def from_crontab(cls, expression, timezone=None):
+                    return cls(expression, timezone=timezone)
+
+            module.CronTrigger = FakeCronTrigger
+            plugin = object.__new__(module.JackettExtend)
+            plugin._enabled = True
+            plugin._cron = "*/15 * * * *"
+            plugin._sync_generation = 4
+            calls = []
+
+            def sync_all(generation=None):
+                calls.append(generation)
+
+            plugin._JackettExtend__sync_all = sync_all
+
+            services = plugin.get_service()
+
+            self.assertIsInstance(services, list)
+            self.assertEqual(len(services), 1)
+            service = services[0]
+            self.assertTrue(service["id"])
+            self.assertEqual(service["id"], plugin.get_service()[0]["id"])
+            self.assertTrue(service["name"])
+            self.assertIsInstance(service["trigger"], FakeCronTrigger)
+            self.assertEqual(service["trigger"].expression, "*/15 * * * *")
+            self.assertEqual(service["trigger"].timezone, "UTC")
+            self.assertTrue(callable(service["func"]))
+            self.assertEqual(service["func_kwargs"], {"generation": 4})
+            self.assertEqual(service["kwargs"], {
+                "max_instances": 1,
+                "coalesce": True,
+                "misfire_grace_time": 3600,
+            })
+            service["func"](**service["func_kwargs"])
+            self.assertEqual(calls, [4])
+
+            plugin._enabled = False
+            self.assertEqual(plugin.get_service(), [])
+
     def test_timeout_is_bounded_and_written_to_form_defaults(self):
         with loaded_module() as module:
             self.assertEqual(module.JackettExtend._normalize_timeout(-1), 5)

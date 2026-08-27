@@ -11,7 +11,6 @@ from typing import List, Dict, Any, Tuple, Optional
 from urllib.parse import urlencode, quote, quote_plus, urlsplit
 
 import requests
-from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 # I1: 双路径兼容导入 SitesHelper。
@@ -84,7 +83,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.2.10"
+    plugin_version = "3.2.11"
     # 插件作者
     plugin_author = "jtcymc"
     # 作者主页
@@ -109,7 +108,6 @@ class JackettExtend(_PluginBase):
     _domain_prefixes = ("jackett_extend.",)
 
     # 私有属性
-    _scheduler = None
     _cron = None
     _enabled = False
     _proxy = False
@@ -252,30 +250,19 @@ class JackettExtend(_PluginBase):
         # generation.  The bridge lazily feature-detects the host boundary.
         _host_compat.install(self, predicate=self._is_virtual_site)
 
-        # 启动定时任务
-        self._scheduler = BackgroundScheduler(timezone=settings.TZ)
+        # Validate the cron expression here so the shared host scheduler only
+        # ever receives a known-good trigger.  The initial synchronization is
+        # still detached from plugin startup below.
         cron_expr = self._cron or "0 0 * * *"
-        logger.info(f"【{self.plugin_name}】 索引更新服务启动，周期：{cron_expr}")
+        logger.info(f"【{self.plugin_name}】 索引更新服务启用，周期：{cron_expr}")
         try:
-            trigger = CronTrigger.from_crontab(cron_expr)
+            CronTrigger.from_crontab(cron_expr, timezone=settings.TZ)
         except Exception as e:
             # A4: cron 表达式非法时回退默认值并告警，避免整个插件初始化崩溃
             logger.warning(
                 f"【{self.plugin_name}】cron 表达式无效：{cron_expr!r}，已回退为默认 '0 0 * * *'：{type(e).__name__}：{str(e)}")
-            trigger = CronTrigger.from_crontab("0 0 * * *")
-        # H2: max_instances=1 + coalesce=True，避免定时任务与热更新实例并发操作
-        self._scheduler.add_job(
-            self.__sync_all,
-            trigger,
-            kwargs={"generation": generation},
-            id=f"{self.plugin_config_prefix}sync",
-            name=f"{self.plugin_name} indexer sync",
-            max_instances=1,
-            coalesce=True,
-            misfire_grace_time=3600,
-        )
-        self._scheduler.print_jobs()
-        self._scheduler.start()
+            with self._state_lock:
+                self._cron = "0 0 * * *"
         # Initial synchronization is deliberately detached from plugin
         # startup.  The first successful, non-empty authoritative snapshot is
         # required before any stale selection/site cleanup is allowed.
@@ -581,6 +568,36 @@ class JackettExtend(_PluginBase):
     def get_state(self) -> bool:
         return self._enabled
 
+    def get_service(self) -> List[Dict[str, Any]]:
+        """Expose the indexer refresh job to MoviePilot's shared scheduler."""
+        with self._state_lock:
+            if not self._enabled:
+                return []
+            cron_expr = self._cron or "0 0 * * *"
+            generation = self._sync_generation
+            try:
+                trigger = CronTrigger.from_crontab(cron_expr, timezone=settings.TZ)
+            except Exception as e:
+                # init_plugin validates this value, but keep the service ABI
+                # safe if a host reads services while replacing configuration.
+                logger.warning(
+                    f"【{self.plugin_name}】cron 表达式无效：{cron_expr!r}，已回退为默认 '0 0 * * *'：{type(e).__name__}：{str(e)}")
+                self._cron = "0 0 * * *"
+                trigger = CronTrigger.from_crontab(self._cron, timezone=settings.TZ)
+            # H2: max_instances=1 + coalesce=True，避免同步回调并发操作。
+            return [{
+                "id": f"{self.plugin_config_prefix}sync",
+                "name": f"{self.plugin_name} indexer sync",
+                "trigger": trigger,
+                "func": self.__sync_all,
+                "func_kwargs": {"generation": generation},
+                "kwargs": {
+                    "max_instances": 1,
+                    "coalesce": True,
+                    "misfire_grace_time": 3600,
+                },
+            }]
+
     def stop_service(self):
         """
         退出插件
@@ -597,16 +614,6 @@ class JackettExtend(_PluginBase):
             # the generation/event before every state-changing operation.
             thread.join(timeout=0.2)
         self._sync_thread = None
-        try:
-            if self._scheduler:
-                self._scheduler.remove_all_jobs()
-                if self._scheduler.running:
-                    # The generation guard above makes a non-blocking shutdown
-                    # safe even when a scheduler callback is already running.
-                    self._scheduler.shutdown(wait=False)
-                self._scheduler = None
-        except Exception as e:
-            logger.error(f"【{self.plugin_name}】停止插件错误: {str(e)}")
 
     def __update_config(self, generation: Optional[int] = None):
         """
