@@ -86,10 +86,9 @@ def loaded_module():
         "apscheduler.triggers": types.ModuleType("apscheduler.triggers"),
         "apscheduler.triggers.cron": types.ModuleType("apscheduler.triggers.cron"),
         "app": types.ModuleType("app"),
-        "app.helper": types.ModuleType("app.helper"),
-        "app.helper.sites": types.ModuleType("app.helper.sites"),
         "app.plugins": types.ModuleType("app.plugins"),
         "app.schemas": types.ModuleType("app.schemas"),
+        "app.schemas.types": types.ModuleType("app.schemas.types"),
         "app.sdk": types.ModuleType("app.sdk"),
         "app.sdk.config": types.ModuleType("app.sdk.config"),
         "app.sdk.logging": types.ModuleType("app.sdk.logging"),
@@ -99,14 +98,16 @@ def loaded_module():
     }
     names["apscheduler.schedulers.background"].BackgroundScheduler = object
     names["apscheduler.triggers.cron"].CronTrigger = object
-    names["app.helper.sites"].SitesHelper = object
     names["app.plugins"]._PluginBase = object
     names["app.schemas"].MediaType = _MediaType
-    names["app.schemas"].MediaSource = _MediaSource
+    names["app.schemas"].__path__ = []
+    names["app.schemas.types"].MediaSource = _MediaSource
+    names["app.sdk"].__path__ = []
     names["app.sdk.config"].settings = types.SimpleNamespace(PROXY=None, TZ="UTC", USER_AGENT="test")
     names["app.sdk.logging"].logger = _Logger()
     names["app.sdk.media"].TorrentInfo = _TorrentInfo
     names["app.sdk.network"].RequestUtils = _RequestUtils
+    names["app.sdk.network"].SitesHelper = object
     names["app.sdk.utilities"].DomUtils = _DomUtils
     names["app.sdk.utilities"].StringUtils = _StringUtils
     previous = {name: sys.modules.get(name) for name in names}
@@ -174,12 +175,11 @@ def isolated_ui_module():
 
 
 @contextmanager
-def site_oper_modules(site_oper, eventmanager=None, event_type=None, fallback=False):
-    """Install isolated DB/event import shims for the real sync boundaries."""
+def site_oper_modules(site_oper, eventmanager=None, event_type=None):
+    """Install isolated current V3 DB/event import shims."""
     names = [
         "app",
         "app.db",
-        "app.db.site_oper",
         "app.db.oper",
         "app.db.oper.site",
         "app.sdk",
@@ -204,16 +204,11 @@ def site_oper_modules(site_oper, eventmanager=None, event_type=None, fallback=Fa
     schemas.__path__ = []
     sys.modules.update({"app": app, "app.db": db, "app.sdk": sdk, "app.schemas": schemas})
 
-    if fallback:
-        oper = types.ModuleType("app.db.oper")
-        oper.__path__ = []
-        site = types.ModuleType("app.db.oper.site")
-        site.SiteOper = site_oper
-        sys.modules.update({"app.db.oper": oper, "app.db.oper.site": site})
-    else:
-        primary = types.ModuleType("app.db.site_oper")
-        primary.SiteOper = site_oper
-        sys.modules["app.db.site_oper"] = primary
+    oper = types.ModuleType("app.db.oper")
+    oper.__path__ = []
+    site = types.ModuleType("app.db.oper.site")
+    site.SiteOper = site_oper
+    sys.modules.update({"app.db.oper": oper, "app.db.oper.site": site})
 
     if eventmanager is not None:
         events = types.ModuleType("app.sdk.events")
@@ -261,26 +256,26 @@ class JackettV3ContractTest(unittest.TestCase):
         walk(page)
         return values
 
-    def test_async_module_is_a_real_threadpool_provider(self):
+    def test_async_module_uses_current_to_thread_provider(self):
         with loaded_module() as module:
             plugin = object.__new__(module.JackettExtend)
             calls = []
-            threadpool_calls = []
+            thread_calls = []
 
             def search(**kwargs):
                 calls.append(kwargs)
                 return ["ok"]
 
-            async def fake_threadpool(func, *args, **kwargs):
-                threadpool_calls.append(func)
+            async def fake_to_thread(func, *args, **kwargs):
+                thread_calls.append(func)
                 return func(*args, **kwargs)
 
-            module.run_in_threadpool = fake_threadpool
+            module.asyncio.to_thread = fake_to_thread
             plugin.search_torrents = search
             result = asyncio.run(plugin.async_search_torrents(site={"domain": "jackett_extend.nyaa"}, keyword="x"))
 
             self.assertEqual(result, ["ok"])
-            self.assertEqual(threadpool_calls, [search])
+            self.assertEqual(thread_calls, [search])
             self.assertEqual(calls[0]["site"]["domain"], "jackett_extend.nyaa")
             self.assertTrue(inspect.iscoroutinefunction(module.JackettExtend.async_search_torrents))
             self.assertTrue(inspect.iscoroutinefunction(module.JackettExtend.get_module(plugin)["async_search_torrents"]))
@@ -1094,7 +1089,7 @@ class JackettV3ContractTest(unittest.TestCase):
             plugin._indexers = []
             called = []
 
-            def failed_status(generation=None):
+            def failed_status(generation=None, config_snapshot=None):
                 plugin._fetch_ok = True
                 plugin._sync_ready = False
                 plugin._authoritative_indexers = []
@@ -1106,6 +1101,23 @@ class JackettV3ContractTest(unittest.TestCase):
             plugin._JackettExtend__sync_remove_stale_sites = lambda *_args: called.append("sites")
             plugin._JackettExtend__sync_all(generation=1)
             self.assertEqual(called, [])
+
+    def test_sync_does_not_fallback_to_legacy_status_signature(self):
+        """V3 synchronization must call the current snapshot-aware contract."""
+        with loaded_module() as module:
+            plugin = object.__new__(module.JackettExtend)
+            plugin._sync_stop_event = __import__("threading").Event()
+            plugin._sync_generation = 1
+
+            # A pre-V3 test/adapter override accepted only ``generation``.
+            # Keeping a retry for that shape would hide an ABI mismatch and
+            # retain the historical compatibility branch in V3-only code.
+            def legacy_status(generation=None):
+                return False
+
+            plugin.get_status = legacy_status
+            with self.assertRaises(TypeError):
+                plugin._JackettExtend__sync_all(generation=1)
 
     def test_sync_stage_failure_keeps_last_sync_ok_false(self):
         with loaded_module() as module:
@@ -1205,56 +1217,54 @@ class JackettSyncBoundaryTest(unittest.TestCase):
 
         return EventManager(), state
 
-    def test_register_site_adds_rows_and_supports_both_oper_import_paths(self):
-        for fallback in (False, True):
-            with self.subTest(fallback=fallback), loaded_module() as module:
-                state = types.SimpleNamespace(adds=[], updates=[], lookups=[])
+    def test_register_site_adds_rows_via_current_oper_import(self):
+        with loaded_module() as module:
+            state = types.SimpleNamespace(adds=[], updates=[], lookups=[])
 
-                class FakeSiteOper:
-                    def get_by_domain(self, domain):
-                        state.lookups.append(domain)
-                        return None
+            class FakeSiteOper:
+                def get_by_domain(self, domain):
+                    state.lookups.append(domain)
+                    return None
 
-                    def add(self, **payload):
-                        state.adds.append(payload)
+                def add(self, **payload):
+                    state.adds.append(payload)
 
-                    def update(self, site_id, payload):
-                        state.updates.append((site_id, payload))
+                def update(self, site_id, payload):
+                    state.updates.append((site_id, payload))
 
-                eventmanager, events = self._event_manager()
-                event_type = types.SimpleNamespace(SiteUpdated="SiteUpdated")
-                plugin = self._active_plugin(module)
-                indexer = {
-                    "name": "Nyaa",
-                    "domain": "jackett_extend.nyaa",
-                    "public": True,
-                    "proxy": True,
-                }
+            eventmanager, events = self._event_manager()
+            event_type = types.SimpleNamespace(SiteUpdated="SiteUpdated")
+            plugin = self._active_plugin(module)
+            indexer = {
+                "name": "Nyaa",
+                "domain": "jackett_extend.nyaa",
+                "public": True,
+                "proxy": True,
+            }
 
-                with site_oper_modules(
-                    FakeSiteOper,
-                    eventmanager=eventmanager,
-                    event_type=event_type,
-                    fallback=fallback,
-                ):
-                    result = plugin._JackettExtend__register_site(indexer, generation=1)
+            with site_oper_modules(
+                FakeSiteOper,
+                eventmanager=eventmanager,
+                event_type=event_type,
+            ):
+                result = plugin._JackettExtend__register_site(indexer, generation=1)
 
-                self.assertTrue(result)
-                self.assertEqual(state.lookups, ["jackett_extend.nyaa"])
-                self.assertEqual(state.adds, [{
-                    "name": "Nyaa",
-                    "domain": "jackett_extend.nyaa",
-                    "url": "https://jackett_extend.nyaa/",
-                    "public": 1,
-                    "proxy": 1,
-                    "is_active": True,
-                    "pri": 1,
-                }])
-                self.assertEqual(state.updates, [])
-                self.assertEqual(
-                    events.calls,
-                    [("SiteUpdated", {"domain": "jackett_extend.nyaa"})],
-                )
+            self.assertTrue(result)
+            self.assertEqual(state.lookups, ["jackett_extend.nyaa"])
+            self.assertEqual(state.adds, [{
+                "name": "Nyaa",
+                "domain": "jackett_extend.nyaa",
+                "url": "https://jackett_extend.nyaa/",
+                "public": 1,
+                "proxy": 1,
+                "is_active": True,
+                "pri": 1,
+            }])
+            self.assertEqual(state.updates, [])
+            self.assertEqual(
+                events.calls,
+                [("SiteUpdated", {"domain": "jackett_extend.nyaa"})],
+            )
 
     def test_register_site_updates_only_plugin_owned_fields(self):
         with loaded_module() as module:
@@ -1293,7 +1303,6 @@ class JackettSyncBoundaryTest(unittest.TestCase):
                 FakeSiteOper,
                 eventmanager=eventmanager,
                 event_type=event_type,
-                fallback=True,
             ):
                 result = plugin._JackettExtend__register_site(indexer, generation=1)
 

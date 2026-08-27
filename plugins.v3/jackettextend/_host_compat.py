@@ -1,11 +1,9 @@
 # _*_ coding: utf-8 _*_
-"""Small, lifecycle-safe compatibility bridge for MoviePilot V3 search.
+"""Lifecycle-safe per-site bridge for the current MoviePilot V3 search API.
 
-The current host exposes stable per-site methods on ``app.chain.ChainBase``;
-its synchronous, asynchronous, and streaming search paths all pass through
-those methods.  JackettExtend only needs to redirect its own virtual profiles
-at that boundary.  This module intentionally does not patch SearchChain loops,
-dispatchers, or any global-plugin path.
+The current host exposes three ChainBase methods for per-site search.  The
+plugin owns only its virtual profiles, so the bridge redirects those calls and
+leaves the host's global-plugin and ordinary-site paths untouched.
 """
 
 import functools
@@ -26,44 +24,6 @@ _METHODS = (
     "async_search_site_torrents",
     "get_search_page_size",
 )
-_LEGACY_DOMAIN_PREFIX = "jackett_extend."
-
-# Explicit host capability markers are preferred.  They are intentionally
-# narrow: generic names such as ``supports_plugins`` are not enough to prove
-# that the host has a targeted per-site route.
-_OFFICIAL_MARKERS = (
-    "supports_targeted_plugin_route",
-    "supports_targeted_plugin_search",
-    "supports_plugin_targeted_route",
-    "targeted_plugin_route_supported",
-    "official_targeted_plugin_route",
-    "TARGETED_PLUGIN_ROUTE",
-)
-
-# A coherent public method family is also a safe opt-out signal for a future
-# host.  One unrelated method is never sufficient.
-_OFFICIAL_METHOD_FAMILIES = (
-    (
-        "search_site_torrents_for_plugin",
-        "async_search_site_torrents_for_plugin",
-        "get_search_page_size_for_plugin",
-    ),
-    (
-        "search_targeted_plugin",
-        "async_search_targeted_plugin",
-        "get_targeted_plugin_page_size",
-    ),
-    (
-        "search_targeted_plugin_torrents",
-        "async_search_targeted_plugin_torrents",
-        "get_targeted_plugin_search_page_size",
-    ),
-    (
-        "search_plugin_site_torrents",
-        "async_search_plugin_site_torrents",
-        "get_plugin_search_page_size",
-    ),
-)
 
 
 def _find_chain_base() -> Optional[type]:
@@ -74,24 +34,6 @@ def _find_chain_base() -> Optional[type]:
         return None
     chain_base = getattr(module, "ChainBase", None)
     return chain_base if inspect.isclass(chain_base) else None
-
-
-def host_supports_targeted_route(chain_base: Optional[type] = None) -> bool:
-    """Feature-detect an official targeted-plugin route conservatively."""
-    chain_base = chain_base or _find_chain_base()
-    if chain_base is None:
-        return False
-    for marker in _OFFICIAL_MARKERS:
-        try:
-            value = getattr(chain_base, marker, None)
-        except Exception:
-            value = None
-        if value is True:
-            return True
-    for family in _OFFICIAL_METHOD_FAMILIES:
-        if all(callable(getattr(chain_base, name, None)) for name in family):
-            return True
-    return False
 
 
 def _normalise_domain(site: Mapping) -> str:
@@ -136,52 +78,32 @@ def _predicate_from_state(state: Mapping) -> Optional[Callable]:
 
 
 def _call_predicate(predicate: Callable, site: Mapping, domain: str):
-    """Call either the plugin's historical (site, domain) or site predicate."""
-    try:
-        return predicate(site, domain)
-    except TypeError as error:
-        try:
-            return predicate(site)
-        except TypeError:
-            raise error
+    """Apply the current virtual-site predicate contract."""
+    return predicate(site, domain)
 
 
 def _site_owned_by_plugin(state: Mapping, site: object) -> bool:
-    """Check markers first, then an optional predicate, then old domain form."""
+    """Return whether the current plugin predicate owns this site."""
     if not isinstance(site, Mapping) or not site:
         # In particular, preserve the host's global ``site={}`` plugin route.
         return False
     owner = _owner_from_state(state)
     if owner is None:
         return False
-    plugin_name = str(getattr(owner, "plugin_name", "JackettExtend") or "").strip().lower()
-    markers = {
-        str(site.get("plugin") or "").strip().lower(),
-        str(site.get("parser") or "").strip().lower(),
-    }
-    if any(markers):
-        return bool(plugin_name and plugin_name in markers)
     domain = _normalise_domain(site)
     predicate = _predicate_from_state(state)
     if predicate is None:
-        # Use the live owner's predicate when available.  Looking it up per
-        # request keeps reloads safe and avoids storing a bound method that
-        # would retain a stopped instance.
+        # Read the current owner on each request so reloads cannot retain a
+        # stopped instance through a bound method.
         candidate = getattr(owner, "_is_virtual_site", None)
         if callable(candidate):
             predicate = candidate
-    if predicate is not None:
-        try:
-            result = _call_predicate(predicate, site, domain)
-        except Exception:
-            result = None
-        if result is not None:
-            return bool(result)
-    # Conservative legacy fallback: only the historical synthetic prefix is
-    # accepted, and a bare prefix with no ID is not considered owned.
-    return domain.lower().startswith(_LEGACY_DOMAIN_PREFIX) and bool(
-        domain[len(_LEGACY_DOMAIN_PREFIX):]
-    )
+    if predicate is None:
+        return False
+    try:
+        return bool(_call_predicate(predicate, site, domain))
+    except Exception:
+        return False
 
 
 def _call_owner(owner: object, method: str, args: tuple, kwargs: dict):
@@ -268,14 +190,6 @@ def install(plugin: object, predicate: Optional[Callable] = None) -> bool:
     """Install/update the per-site wrappers for the current plugin owner."""
     chain_base = _find_chain_base()
     if chain_base is None:
-        return False
-
-    # If an official targeted route exists, a stale compat patch from an
-    # earlier plugin load must not remain active.  Restore it before opting out.
-    if host_supports_targeted_route(chain_base):
-        state = getattr(chain_base, _STATE_ATTR, None)
-        if isinstance(state, Mapping):
-            _restore(chain_base, state)
         return False
 
     state = getattr(chain_base, _STATE_ATTR, None)
@@ -384,14 +298,12 @@ def status() -> dict:
         return {
             "available": True,
             "installed": False,
-            "official_route": host_supports_targeted_route(chain_base),
             "owner_alive": False,
         }
     owner = _owner_from_state(state)
     return {
         "available": True,
         "installed": True,
-        "official_route": host_supports_targeted_route(chain_base),
         "owner_alive": owner is not None,
         "methods": tuple(_METHODS),
     }

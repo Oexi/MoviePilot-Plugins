@@ -42,10 +42,9 @@ def loaded_plugin_module():
         "apscheduler.triggers": types.ModuleType("apscheduler.triggers"),
         "apscheduler.triggers.cron": types.ModuleType("apscheduler.triggers.cron"),
         "app": types.ModuleType("app"),
-        "app.helper": types.ModuleType("app.helper"),
-        "app.helper.sites": types.ModuleType("app.helper.sites"),
         "app.plugins": types.ModuleType("app.plugins"),
         "app.schemas": types.ModuleType("app.schemas"),
+        "app.schemas.types": types.ModuleType("app.schemas.types"),
         "app.sdk": types.ModuleType("app.sdk"),
         "app.sdk.config": types.ModuleType("app.sdk.config"),
         "app.sdk.logging": types.ModuleType("app.sdk.logging"),
@@ -55,13 +54,16 @@ def loaded_plugin_module():
     }
     stubs["apscheduler.schedulers.background"].BackgroundScheduler = object
     stubs["apscheduler.triggers.cron"].CronTrigger = object
-    stubs["app.helper.sites"].SitesHelper = object
     stubs["app.plugins"]._PluginBase = object
     stubs["app.schemas"].MediaType = object
+    stubs["app.schemas"].__path__ = []
+    stubs["app.schemas.types"].MediaSource = object
+    stubs["app.sdk"].__path__ = []
     stubs["app.sdk.config"].settings = types.SimpleNamespace(PROXY=None)
     stubs["app.sdk.logging"].logger = LoggerStub()
     stubs["app.sdk.media"].TorrentInfo = object
     stubs["app.sdk.network"].RequestUtils = object
+    stubs["app.sdk.network"].SitesHelper = object
     stubs["app.sdk.utilities"].DomUtils = object
     stubs["app.sdk.utilities"].StringUtils = StringUtilsStub
 

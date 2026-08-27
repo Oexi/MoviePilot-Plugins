@@ -1,7 +1,6 @@
 # _*_ coding: utf-8 _*_
 import asyncio
 import copy
-import functools
 import math
 import re
 import threading
@@ -13,30 +12,13 @@ from urllib.parse import urlencode, quote, quote_plus, urlsplit
 import requests
 from apscheduler.triggers.cron import CronTrigger
 
-# I1: 双路径兼容导入 SitesHelper。
-# devbox 等旧结构宿主位于 app.helper.sites,GitHub main 新架构位于 app.application.site.sites;
-# 无 compat 层的宿主也能回退到规范路径,避免顶层 ImportError 导致插件整体无法加载。
-try:
-    from app.helper.sites import SitesHelper
-except ImportError:
-    try:
-        from app.application.site.sites import SitesHelper
-    except ImportError:
-        SitesHelper = None
-
 from app.sdk.media import TorrentInfo
 from app.sdk.logging import logger
 from app.plugins import _PluginBase
 from app.sdk.config import settings
 from app.schemas import MediaType
-try:
-    from app.schemas import MediaSource
-except ImportError:
-    try:
-        from app.schemas.types import MediaSource
-    except ImportError:
-        MediaSource = None
-from app.sdk.network import RequestUtils
+from app.schemas.types import MediaSource
+from app.sdk.network import RequestUtils, SitesHelper
 from app.sdk.utilities import StringUtils
 
 from ._torznab import (
@@ -62,25 +44,6 @@ from ._indexers import (
 )
 from ._ui import build_form, build_page
 
-# V3's module dispatcher awaits async providers.  Prefer the host's context-
-# preserving helper, then FastAPI/Starlette compatibility imports.  The tiny
-# asyncio fallback keeps the plugin importable in unit-test fixtures that do
-# not install either web framework.
-try:
-    from app.runtime.execution import run_in_threadpool
-except ImportError:
-    try:
-        from fastapi.concurrency import run_in_threadpool
-    except ImportError:
-        try:
-            from starlette.concurrency import run_in_threadpool
-        except ImportError:
-            async def run_in_threadpool(func, *args, **kwargs):
-                loop = asyncio.get_running_loop()
-                call = functools.partial(func, *args, **kwargs)
-                return await loop.run_in_executor(None, call)
-
-
 class JackettExtend(_PluginBase):
     # 插件名称
     plugin_name = "JackettExtend"
@@ -89,7 +52,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.2.13"
+    plugin_version = "3.2.14"
     # 插件作者
     plugin_author = "jtcymc"
     # 作者主页
@@ -157,13 +120,13 @@ class JackettExtend(_PluginBase):
         """
         初始化插件
         """
-        # Stop an older instance before replacing any shared configuration.
+        # Stop the previous instance before replacing any shared configuration.
         # This prevents a reload's in-flight worker from using the new host or
         # credentials and mutating the new instance's site state.
         self.stop_service()
 
         # All replacement of configuration/state is serialized with the
-        # short commit phase.  An old worker may still be finishing a DB/event
+        # short commit phase.  A previous-generation worker may still be finishing a DB/event
         # operation after stop_service() returns; waiting here ensures the
         # new generation cannot be overwritten by that operation.
         with self._sync_lock:
@@ -193,19 +156,16 @@ class JackettExtend(_PluginBase):
                 self._last_search_error = None
                 self._last_search_error_at = 0.0
 
-                # A fresh generation makes old scheduler callbacks harmless
+                # A fresh generation makes prior scheduler callbacks harmless
                 # even if a host cannot cancel a callback already queued.
                 self._sync_generation += 1
                 generation = self._sync_generation
                 self._sync_stop_event = threading.Event()
 
-        if SitesHelper is not None:
-            try:
-                self.sites_helper = SitesHelper()
-            except Exception as e:
-                logger.warning(f"【{self.plugin_name}】SitesHelper 初始化失败：{type(e).__name__}：{str(e)}")
-                self.sites_helper = None
-        else:
+        try:
+            self.sites_helper = SitesHelper()
+        except Exception as e:
+            logger.warning(f"【{self.plugin_name}】SitesHelper 初始化失败：{type(e).__name__}：{str(e)}")
             self.sites_helper = None
 
         # 读取配置.  Keep assignment under the state lock so a concurrent
@@ -249,7 +209,7 @@ class JackettExtend(_PluginBase):
             # while its request is in flight.
             self._config_snapshot = self._capture_config_snapshot_locked()
         if not self._enabled:
-            # The compatibility bridge is owned by the plugin lifecycle, not
+            # The V3 search bridge is owned by the plugin lifecycle, not
             # by module import.  Disabled/reloaded instances must release a
             # patch only when they are still the current owner.
             _host_compat.uninstall(self)
@@ -333,7 +293,7 @@ class JackettExtend(_PluginBase):
 
     @classmethod
     def _is_virtual_site(cls, site: dict, domain: str = "") -> bool:
-        """Recognize both current domains and old records after a reload."""
+        """Recognize current virtual domains and persisted records."""
         return is_virtual_site(
             site,
             domain=domain,
@@ -408,16 +368,10 @@ class JackettExtend(_PluginBase):
             # on that single observation.
             if not sync_ready or not isinstance(indexers_snapshot, list) or not indexers_snapshot:
                 return True
-            try:
-                from app.db.site_oper import SiteOper
-            except ImportError:
-                from app.db.oper.site import SiteOper
-            try:
-                from app.sdk.events import eventmanager
-                from app.schemas.types import EventType
-            except ImportError:
-                eventmanager = None
-                EventType = None
+            from app.db.oper.site import SiteOper
+            from app.schemas.types import EventType
+            from app.sdk.events import eventmanager
+
             current_domains = {
                 str(i.get("domain", "")).lower()
                 for i in indexers_snapshot
@@ -434,12 +388,11 @@ class JackettExtend(_PluginBase):
                     site_oper.delete(site.id)
                     logger.info(f"【{self.plugin_name}】已清理过期站点记录: {site_domain}")
                     # A2: 删除后发送 SiteDeleted 事件,触发宿主清理搜索开关/缓存
-                    if eventmanager is not None:
-                        try:
-                            eventmanager.send_event(EventType.SiteDeleted, {"site_id": site.id})
-                        except Exception as e:
-                            stage_ok = False
-                            logger.warning(f"【{self.plugin_name}】发送 SiteDeleted 事件失败：{type(e).__name__}：{str(e)}")
+                    try:
+                        eventmanager.send_event(EventType.SiteDeleted, {"site_id": site.id})
+                    except Exception as e:
+                        stage_ok = False
+                        logger.warning(f"【{self.plugin_name}】发送 SiteDeleted 事件失败：{type(e).__name__}：{str(e)}")
             return stage_ok
         except Exception as e:
             logger.error(f"【{self.plugin_name}】清理过期站点失败: {str(e)}")
@@ -514,14 +467,10 @@ class JackettExtend(_PluginBase):
             config_snapshot = dict(getattr(self, "_config_snapshot", {}) or {})
             if not config_snapshot:
                 config_snapshot = self._capture_config_snapshot_locked()
-        try:
-            status_ok = self.get_status(generation=generation, config_snapshot=config_snapshot)
-        except TypeError as exc:
-            # Keep compatibility with host/test shims that override the
-            # historical one-argument get_status hook.
-            if "config_snapshot" not in str(exc):
-                raise
-            status_ok = self.get_status(generation=generation)
+        # The V3 synchronization contract is snapshot-aware.  Do not retry
+        # with the removed one-argument hook: that historical fallback could
+        # hide an ABI mismatch and let a worker read mutable live config.
+        status_ok = self.get_status(generation=generation, config_snapshot=config_snapshot)
         if not status_ok:
             with self._state_lock:
                 if generation is None or self._sync_is_current(generation):
@@ -682,17 +631,10 @@ class JackettExtend(_PluginBase):
         if not domain:
             return False
         try:
-            # 双架构兼容：V2/V3 镜像旧路径由宿主 compat 层路由到规范路径
-            try:
-                from app.db.site_oper import SiteOper
-            except ImportError:
-                from app.db.oper.site import SiteOper
-            try:
-                from app.sdk.events import eventmanager
-                from app.schemas.types import EventType
-            except ImportError:
-                eventmanager = None
-                EventType = None
+            from app.db.oper.site import SiteOper
+            from app.schemas.types import EventType
+            from app.sdk.events import eventmanager
+
             site_oper = SiteOper()
             exists = site_oper.get_by_domain(domain)
             name = indexer.get("name", "")
@@ -729,12 +671,11 @@ class JackettExtend(_PluginBase):
                     site_oper.update(existing.id, {"name": name, "url": url, "public": public})
                     logger.debug(f"【{self.plugin_name}】站点已存在(并发注册),转为更新: {domain}, {type(e).__name__}: {str(e)}")
             # 通知宿主刷新站点缓存
-            if eventmanager is not None:
-                try:
-                    eventmanager.send_event(EventType.SiteUpdated, {"domain": domain})
-                except Exception as e:
-                    logger.warning(f"【{self.plugin_name}】发送 SiteUpdated 事件失败：{type(e).__name__}：{str(e)}")
-                    return False
+            try:
+                eventmanager.send_event(EventType.SiteUpdated, {"domain": domain})
+            except Exception as e:
+                logger.warning(f"【{self.plugin_name}】发送 SiteUpdated 事件失败：{type(e).__name__}：{str(e)}")
+                return False
             return True
         except Exception as e:
             logger.error(f"【{self.plugin_name}】注册站点 {domain} 到 DB 失败: {str(e)}")
@@ -943,7 +884,7 @@ class JackettExtend(_PluginBase):
                                      cat: Optional[str] = None,
                                      page: Optional[int] = 0, **kwargs) -> List[TorrentInfo]:
         """Run the synchronous HTTP parser off the event loop."""
-        return await run_in_threadpool(
+        return await asyncio.to_thread(
             self.search_torrents,
             site=site,
             keyword=keyword,
@@ -1411,11 +1352,7 @@ class JackettExtend(_PluginBase):
                 media_id = None
                 if imdbid:
                     media_id = imdbid
-                    if MediaSource is not None:
-                        try:
-                            media_source = MediaSource.IMDb
-                        except AttributeError:
-                            media_source = None
+                    media_source = MediaSource.IMDb
 
                 tmp_dict = TorrentInfo(
                     title=title,

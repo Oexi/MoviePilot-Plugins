@@ -41,6 +41,10 @@ class Owner:
         self.page_calls.append((args, kwargs))
         return None
 
+    @staticmethod
+    def _is_virtual_site(site, domain=""):
+        return bool(site.get("owned"))
+
 
 def make_chain():
     calls = []
@@ -89,7 +93,7 @@ class HostCompatTest(unittest.TestCase):
         else:
             sys.modules["app.chain"] = self.previous_chain
 
-    def test_marked_and_legacy_virtual_sites_route_all_boundaries(self):
+    def test_predicate_routes_only_current_three_chain_boundaries(self):
         owner = Owner()
         originals = {
             name: getattr(self.ChainBase, name)
@@ -98,11 +102,11 @@ class HostCompatTest(unittest.TestCase):
         self.assertTrue(COMPAT.install(owner))
         chain = self.ChainBase()
 
-        marked = {"domain": "ordinary.example", "plugin": "JackettExtend"}
-        legacy = {"domain": "jackett_extend.nyaa"}
-        ordinary = {"domain": "ordinary.example", "plugin": "OtherPlugin"}
+        marked = {"domain": "ordinary.example", "owned": True}
+        persisted_shape = {"domain": "jackett_extend.nyaa"}
+        ordinary = {"domain": "ordinary.example", "owned": False}
         self.assertEqual(chain.search_site_torrents(marked, "title"), ["plugin-sync"])
-        self.assertEqual(chain.search_site_torrents(legacy, "title"), ["plugin-sync"])
+        self.assertEqual(chain.search_site_torrents(persisted_shape, "title"), ["host-sync"])
         self.assertEqual(chain.search_site_torrents(ordinary, "title"), ["host-sync"])
         self.assertEqual(chain.search_site_torrents({}, "global"), ["host-sync"])
         self.assertEqual(asyncio.run(chain.async_search_site_torrents(marked, "title")), ["plugin-async"])
@@ -110,7 +114,7 @@ class HostCompatTest(unittest.TestCase):
         self.assertIsNone(chain.get_search_page_size(marked, "title"))
         self.assertEqual(chain.get_search_page_size(ordinary, "title"), 50)
         self.assertEqual(chain.get_search_page_size({}, "global"), 50)
-        self.assertEqual(len(owner.sync_calls), 2)
+        self.assertEqual(len(owner.sync_calls), 1)
         self.assertEqual(len(owner.async_calls), 1)
         self.assertEqual(len(owner.page_calls), 1)
         self.assertTrue(COMPAT.uninstall(owner))
@@ -126,7 +130,12 @@ class HostCompatTest(unittest.TestCase):
         second = Owner()
         self.assertTrue(COMPAT.install(second))
         self.assertIs(self.ChainBase.search_site_torrents, wrapped)
-        self.assertEqual(self.ChainBase().search_site_torrents({"domain": "jackett_extend.a"}, "x"), ["plugin-sync"])
+        self.assertEqual(
+            self.ChainBase().search_site_torrents(
+                {"domain": "jackett_extend.a", "owned": True}, "x"
+            ),
+            ["plugin-sync"],
+        )
         self.assertEqual(first.sync_calls, [])
         self.assertEqual(len(second.sync_calls), 1)
         self.assertFalse(COMPAT.uninstall(first))
@@ -134,16 +143,21 @@ class HostCompatTest(unittest.TestCase):
         self.assertTrue(COMPAT.uninstall(second))
         self.assertFalse(COMPAT.status()["installed"])
 
-    def test_official_targeted_route_skips_patch(self):
+    def test_host_capability_attributes_do_not_change_current_boundary(self):
         original = self.ChainBase.search_site_torrents
         self.ChainBase.supports_targeted_plugin_route = True
-        self.assertTrue(COMPAT.host_supports_targeted_route(self.ChainBase))
-        self.assertFalse(COMPAT.install(Owner()))
-        self.assertIs(self.ChainBase.search_site_torrents, original)
+        owner = Owner()
+        self.assertFalse(hasattr(COMPAT, "host_supports_targeted_route"))
+        self.assertTrue(COMPAT.install(owner))
+        self.assertIsNot(self.ChainBase.search_site_torrents, original)
+        self.assertEqual(
+            self.ChainBase().search_site_torrents({"domain": "x", "owned": True}, "x"),
+            ["plugin-sync"],
+        )
 
     def test_custom_predicate_can_claim_a_non_legacy_site(self):
         owner = Owner()
-        self.assertTrue(COMPAT.install(owner, predicate=lambda site: site.get("owned") is True))
+        self.assertTrue(COMPAT.install(owner, predicate=lambda site, _domain: site.get("owned") is True))
         result = self.ChainBase().search_site_torrents({"domain": "custom.example", "owned": True}, "x")
         self.assertEqual(result, ["plugin-sync"])
 
