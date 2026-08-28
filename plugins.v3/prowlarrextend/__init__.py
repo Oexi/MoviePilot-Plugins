@@ -54,7 +54,7 @@ class ProwlarrExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Prowlarr.png"
     # 插件版本
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     # 插件作者
     plugin_author = "Oexi"
     # 作者主页
@@ -790,7 +790,8 @@ class ProwlarrExtend(_PluginBase):
             return False
 
     def search_torrents(self, site: dict, keyword: str = None, mtype: Optional[MediaType] = None,
-                        cat: Optional[str] = None, page: Optional[int] = 0, **kwargs) -> \
+                        cat: Optional[str] = None, page: Optional[int] = 0,
+                        _propagate_upstream_error: bool = False, **kwargs) -> \
             List[
                 TorrentInfo]:
         """
@@ -845,6 +846,7 @@ class ProwlarrExtend(_PluginBase):
         # D4: keyword 为空时使用 Prowlarr 空查询获取最新资源(refresh_torrents/RSS 刷新)
         keyword = keyword or ""
         keyword = StringUtils.clear(text=keyword, replace_word=" ", allow_space=True)
+        propagate_upstream_error = bool(_propagate_upstream_error and not keyword)
         masked_keyword = self.__mask_keyword(keyword)
         api_url = ""
         config_snapshot = self._config_for_sync()
@@ -901,6 +903,7 @@ class ProwlarrExtend(_PluginBase):
             result_array = self.__parse_torznab_xml(
                 api_url, site=site, mtype=mtype, keyword=keyword,
                 config_snapshot=config_snapshot,
+                propagate_upstream_error=propagate_upstream_error,
             )
 
             if not result_array:
@@ -911,6 +914,11 @@ class ProwlarrExtend(_PluginBase):
             logger.debug(f"【{self.plugin_name}】Indexer：\"{site.get('name')}\" 返回数据：{len(result_array)} 条")
             results.extend(result_array)
 
+        except _host_compat.SanitizedUpstreamError:
+            # Only the dedicated empty-keyword refresh route opts into this
+            # process-stable, non-sensitive signal.  Ordinary searches never
+            # request propagation and remain fail-closed.
+            raise
         except Exception as e:
             # D8: 异常日志附带 URL/站点/关键词(脱敏)/异常类型
             self._record_error("search_error", source="search")
@@ -920,6 +928,21 @@ class ProwlarrExtend(_PluginBase):
                 f"类型={type(e).__name__}")
 
         return results
+
+    def refresh_torrents(self, site: dict, keyword: str = None,
+                         mtype: Optional[MediaType] = None,
+                         cat: Optional[str] = None,
+                         page: Optional[int] = 0, **kwargs) -> List[TorrentInfo]:
+        """Refresh one owned site, distinguishing upstream failure from empty."""
+        return self.search_torrents(
+            site=site,
+            keyword=keyword,
+            mtype=mtype,
+            cat=cat,
+            page=page,
+            _propagate_upstream_error=True,
+            **kwargs,
+        )
 
     async def async_search_torrents(self, site: dict, keyword: str = None,
                                      mtype: Optional[MediaType] = None,
@@ -940,8 +963,9 @@ class ProwlarrExtend(_PluginBase):
                                       mtype: Optional[MediaType] = None,
                                       cat: Optional[str] = None,
                                       page: Optional[int] = 0, **kwargs) -> List[TorrentInfo]:
-        """Async refresh counterpart; it shares the same thread-bound search."""
-        return await self.async_search_torrents(
+        """Run the dedicated refresh boundary off the event loop."""
+        return await asyncio.to_thread(
+            self.refresh_torrents,
             site=site,
             keyword=keyword,
             mtype=mtype,
@@ -1124,6 +1148,9 @@ class ProwlarrExtend(_PluginBase):
         def _wrapped_search(*args, **kwargs):
             return self.search_torrents(*args, **kwargs)
 
+        def _wrapped_refresh(*args, **kwargs):
+            return self.refresh_torrents(*args, **kwargs)
+
         async def _wrapped_async_search(*args, **kwargs):
             return await self.async_search_torrents(*args, **kwargs)
 
@@ -1133,7 +1160,7 @@ class ProwlarrExtend(_PluginBase):
         return {
             "search_torrents": _wrapped_search,
             "async_search_torrents": _wrapped_async_search,
-            "refresh_torrents": _wrapped_search,
+            "refresh_torrents": _wrapped_refresh,
             "async_refresh_torrents": _wrapped_async_refresh,
             "get_search_page_size": self.get_search_page_size,
         }
@@ -1248,7 +1275,8 @@ class ProwlarrExtend(_PluginBase):
         return f"{'*' * min(len(str(keyword)), 12)}({len(str(keyword))})"
 
     def __parse_torznab_xml(self, url, site: dict = None, mtype: Optional[MediaType] = None,
-                            keyword: str = None, config_snapshot: Optional[dict] = None) -> List[TorrentInfo]:
+                            keyword: str = None, config_snapshot: Optional[dict] = None,
+                            propagate_upstream_error: bool = False) -> List[TorrentInfo]:
         """
         从 torznab XML 中解析种子信息
         :param url: XML 数据的 URL
@@ -1256,6 +1284,12 @@ class ProwlarrExtend(_PluginBase):
         """
         if not url:
             return []
+
+        def upstream_failure(category: str) -> list:
+            if propagate_upstream_error and not keyword:
+                raise _host_compat.SanitizedUpstreamError(category)
+            return []
+
         log_url = redact_url(url)
         request_config = dict(config_snapshot or self._config_for_sync())
         request_timeout = self._normalize_timeout(
@@ -1278,56 +1312,79 @@ class ProwlarrExtend(_PluginBase):
         except (requests.Timeout, TimeoutError):
             self._record_error("timeout", source="search")
             logger.warning(f"【{self.plugin_name}】torznab 响应超时：url={log_url}")
-            return []
+            return upstream_failure("timeout")
         except Exception as e:
             # Request exception text may echo the original URL; only record
             # the exception type.
             self._record_error("request_error", source="search")
             logger.error(f"【{self.plugin_name}】torznab 请求异常：url={log_url}, 类型={type(e).__name__}")
-            return []
+            return upstream_failure("request_error")
         if ret is None:
             self._record_error("empty", source="search")
             logger.debug(f"【{self.plugin_name}】torznab 空响应：url={log_url}")
-            return []
+            return upstream_failure("empty_response")
 
         # F1: 校验状态码与 Content-Type;JSON 错误体不进 XML 解析
         response_headers = getattr(ret, "headers", {}) or {}
         content_type = (response_headers.get("Content-Type") or "").lower()
-        response_text = getattr(ret, "text", "")
+        # ``requests.Response.content`` is the original wire representation;
+        # use it as the XML contract because a host adapter can expose a
+        # malformed or misdecoded ``text`` value.  Only consult ``text`` when
+        # the response has no bytes payload (some lightweight host doubles do
+        # not provide ``content``).
+        raw_content = getattr(ret, "content", None)
+        if isinstance(raw_content, (bytes, bytearray, memoryview)):
+            body = bytes(raw_content)
+        else:
+            body = getattr(ret, "text", "")
         status_code = getattr(ret, "status_code", 0)
         response_category = classify_torznab_response(
-            status_code, content_type, response_text
+            status_code, content_type, body
         )
         if response_category != "ok":
             if response_category == "http_error":
-                self._record_error(f"http_{status_code}", source="search")
+                error_category = f"http_{status_code}"
+                self._record_error(error_category, source="search")
             else:
+                error_category = (
+                    "empty_response" if response_category == "empty"
+                    else "invalid_response"
+                )
                 self._record_error(response_category, source="search")
             logger.warning(
                 f"【{self.plugin_name}】Prowlarr torznab 响应不可用："
                 f"url={log_url}, category={response_category}, HTTP={status_code}, "
                 f"content_type={content_type or '-'}"
             )
-            return []
+            return upstream_failure(error_category)
 
-        body = response_text
         if isinstance(body, bytes):
-            body = body.decode("utf-8", errors="replace")
-        if not isinstance(body, str) or not body.strip():
+            body_empty = not body.strip()
+            body_size = len(body)
+            doctype_match = re.search(rb"<!DOCTYPE\b", body, flags=re.IGNORECASE)
+        elif isinstance(body, str):
+            body_empty = not body.strip()
+            body_size = len(body.encode("utf-8", errors="ignore"))
+            doctype_match = re.search(r"<!DOCTYPE\b", body, flags=re.IGNORECASE)
+        else:
+            body_empty = True
+            body_size = 0
+            doctype_match = None
+        if body_empty:
             self._record_error("empty", source="search")
             logger.debug(f"【{self.plugin_name}】torznab 空响应：url={log_url}")
-            return []
+            return upstream_failure("empty_response")
         # Keep minidom bounded and reject DTD/entity declarations before the
         # parser sees them.  Normal Torznab RSS is small and has no DOCTYPE;
         # oversized/adversarial payloads are treated as an invalid response.
-        if len(body.encode("utf-8", errors="ignore")) > self.TORZNAB_MAX_XML_BYTES:
+        if body_size > self.TORZNAB_MAX_XML_BYTES:
             self._record_error("xml_too_large", source="search")
             logger.warning(f"【{self.plugin_name}】torznab XML 超出大小限制：url={log_url}")
-            return []
-        if re.search(r"<!DOCTYPE\b", body, flags=re.IGNORECASE):
+            return upstream_failure("invalid_response")
+        if doctype_match:
             self._record_error("xml_doctype", source="search")
             logger.warning(f"【{self.plugin_name}】torznab XML 含不支持的 DOCTYPE：url={log_url}")
-            return []
+            return upstream_failure("invalid_response")
 
         torrents = []
         # One primary identity per item.  Secondary fields must not be added
@@ -1344,17 +1401,17 @@ class ProwlarrExtend(_PluginBase):
             if root_name.lower() == "error":
                 self._record_error("torznab_error", source="search")
                 logger.warning(f"【{self.plugin_name}】torznab 返回错误 XML")
-                return []
+                return upstream_failure("torznab_error")
             items = root_node.getElementsByTagName("item")
             if len(items) > self.TORZNAB_MAX_ITEMS:
                 self._record_error("xml_too_many_items", source="search")
                 logger.warning(f"【{self.plugin_name}】torznab XML item 数量超出限制：url={log_url}")
-                return []
+                return upstream_failure("invalid_response")
         except Exception as e:
             # F1: XML 解析失败降为 WARNING,不输出完整 traceback 刷屏
             self._record_error("xml_error", source="search")
             logger.warning(f"【{self.plugin_name}】torznab XML 解析失败：url={log_url}, 类型={type(e).__name__}")
-            return []
+            return upstream_failure("torznab_error")
 
         for item in items:
             try:

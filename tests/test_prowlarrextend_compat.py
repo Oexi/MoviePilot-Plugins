@@ -26,17 +26,25 @@ class Owner:
         self.sync_calls = 0
         self.async_calls = 0
         self.async_refresh_calls = 0
+        self.error_factory = None
+
+    def _raise_if_configured(self):
+        if self.error_factory is not None:
+            raise self.error_factory()
 
     def search_torrents(self, *args, **kwargs):
         self.sync_calls += 1
+        self._raise_if_configured()
         return [self.value]
 
     async def async_search_torrents(self, *args, **kwargs):
         self.async_calls += 1
+        self._raise_if_configured()
         return [self.value]
 
     async def async_refresh_torrents(self, *args, **kwargs):
         self.async_refresh_calls += 1
+        self._raise_if_configured()
         return [self.value]
 
 
@@ -181,6 +189,48 @@ class ProwlarrCompatContractTest(unittest.TestCase):
                 ["host"],
             )
             self.assertEqual(prowlarr.async_refresh_calls, 1)
+
+            # A marked Prowlarr upstream failure is fail-closed at ordinary
+            # search boundaries, but crosses the dedicated refresh boundary
+            # even when the shared wrapper came from the other module copy.
+            prowlarr.error_factory = lambda: prowlarr_compat.SanitizedUpstreamError(
+                "http_429"
+            )
+            self.assertEqual(
+                chain_instance.search_site_torrents(
+                    {"domain": "prowlarr_extend.7"}, "title"
+                ),
+                ["host"],
+            )
+            self.assertEqual(
+                asyncio.run(chain_instance.async_search_site_torrents(
+                    {"domain": "prowlarr_extend.7"}, "title"
+                )),
+                ["host"],
+            )
+            with self.assertRaises(prowlarr_compat.SanitizedUpstreamError):
+                chain_instance.refresh_torrents(
+                    {"domain": "prowlarr_extend.7"}, None
+                )
+            with self.assertRaises(prowlarr_compat.SanitizedUpstreamError):
+                asyncio.run(chain_instance.async_refresh_torrents(
+                    {"domain": "prowlarr_extend.7"}, None
+                ))
+            # Other owners and ordinary/global host routing remain isolated.
+            self.assertEqual(
+                chain_instance.refresh_torrents(
+                    {"domain": "jackett_extend.nyaa"}, None
+                ),
+                ["jackett"],
+            )
+            self.assertEqual(
+                chain_instance.refresh_torrents(
+                    {"domain": "ordinary.example"}, None
+                ),
+                ["host"],
+            )
+            self.assertEqual(chain_instance.refresh_torrents({}, None), ["host"])
+            prowlarr.error_factory = None
 
             # Disabling either first leaves the other plugin active.
             if first_name == "jackett":

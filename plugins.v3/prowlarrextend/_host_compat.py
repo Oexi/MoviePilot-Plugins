@@ -17,6 +17,7 @@ remain host-owned.
 import functools
 import importlib
 import inspect
+import re
 import sys
 import threading
 import types
@@ -85,6 +86,46 @@ _lock_holder.install_lock = threading.RLock()
 _lock_holder = sys.modules.setdefault(_SHARED_LOCK_KEY, _lock_holder)
 _STATE_INIT_LOCK = _lock_holder.install_lock
 _MISSING = object()
+
+# Refresh callers need to distinguish a real upstream failure from a valid
+# empty feed without coupling a process-wide wrapper to the module copy that
+# raised the exception.  The value marker is therefore part of the shared ABI:
+# a wrapper installed from JackettExtend can recognize an exception created by
+# ProwlarrExtend (and vice versa) without relying on ``isinstance``.
+_UPSTREAM_ERROR_ATTR = "__moviepilot_virtual_site_upstream_error__"
+_UPSTREAM_ERROR_MARKER = "sanitized-upstream-error-v1"
+
+
+class SanitizedUpstreamError(RuntimeError):
+    """Non-sensitive upstream failure that may cross a dedicated refresh API."""
+
+    __moviepilot_virtual_site_upstream_error__ = _UPSTREAM_ERROR_MARKER
+
+    def __init__(self, category: object = "upstream_error"):
+        value = str(category or "upstream_error")
+        allowed = {
+            "timeout",
+            "request_error",
+            "empty_response",
+            "invalid_response",
+            "torznab_error",
+        }
+        if value not in allowed and not re.fullmatch(r"http_[1-5][0-9]{2}", value):
+            value = "upstream_error"
+        self.category = value
+        super().__init__(f"Virtual site upstream request failed ({value})")
+
+
+def _is_sanitized_upstream_error(error: BaseException) -> bool:
+    """Recognize the process-stable refresh signal from any module copy."""
+    try:
+        return getattr(error, _UPSTREAM_ERROR_ATTR, None) == _UPSTREAM_ERROR_MARKER
+    except Exception:
+        return False
+
+
+def _propagates_upstream_error(route: str, error: BaseException) -> bool:
+    return route in _OPTIONAL_METHODS and _is_sanitized_upstream_error(error)
 
 
 def _find_chain_base() -> Optional[type]:
@@ -371,10 +412,12 @@ def _make_sync_wrapper(original, state, route: str = "search_site_torrents"):
                     args[1:],
                     kwargs,
                 )
-            except Exception:
+            except Exception as error:
                 # A plugin module must not break the host's ordinary search
                 # chain.  BaseException (including cancellation) is allowed
                 # through deliberately.
+                if _propagates_upstream_error(route, error):
+                    raise
                 pass
         return original(*args, **kwargs)
 
@@ -395,7 +438,9 @@ def _make_async_wrapper(original, state, route: str = "async_search_site_torrent
                     args[1:],
                     kwargs,
                 )
-            except Exception:
+            except Exception as error:
+                if _propagates_upstream_error(route, error):
+                    raise
                 pass
         result = original(*args, **kwargs)
         if inspect.isawaitable(result):

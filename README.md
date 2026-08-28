@@ -57,4 +57,4 @@ tests/                      # 自动化测试
 
 ## 许可证
 
-本项目采用 GPL-3.0-or-later，详见 [LICENSE](LICENSE)。
+本项目采用 GPL-3.0，详见 [LICENSE](LICENSE)。

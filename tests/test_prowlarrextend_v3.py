@@ -11,9 +11,11 @@ import json
 import sys
 import types
 import unittest
+import xml.dom.minidom
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+from xml.parsers.expat import ExpatError
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -144,14 +146,14 @@ def loaded_module():
 class ProwlarrV3ContractTest(unittest.TestCase):
     def test_metadata_module_and_async_search_contract(self):
         manifest = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["ProwlarrExtend"]["version"], "1.0.1")
+        self.assertEqual(manifest["ProwlarrExtend"]["version"], "1.0.2")
         self.assertEqual(manifest["ProwlarrExtend"]["icon"], "Prowlarr.png")
         self.assertEqual(manifest["ProwlarrExtend"]["author"], "Oexi")
         self.assertEqual(manifest["JackettExtend"]["version"], "3.2.15")
         with loaded_module() as module:
             self.assertEqual(module.ProwlarrExtend.plugin_icon, "Prowlarr.png")
             self.assertEqual(module.ProwlarrExtend.plugin_author, "Oexi")
-            self.assertEqual(module.ProwlarrExtend.plugin_version, "1.0.1")
+            self.assertEqual(module.ProwlarrExtend.plugin_version, "1.0.2")
             self.assertEqual(module.ProwlarrExtend.plugin_config_prefix, "prowlarr_extend_")
 
             plugin = object.__new__(module.ProwlarrExtend)
@@ -418,6 +420,47 @@ class ProwlarrV3ContractTest(unittest.TestCase):
             plugin.search_torrents(site=site, keyword="Sample Film")
             self.assertEqual(timeouts, [12])
 
+    def test_empty_refresh_propagates_sanitized_http_429_only(self):
+        with loaded_module() as module:
+            response = _Response(
+                status_code=429,
+                headers={
+                    "Content-Type": "application/rss+xml",
+                    "Retry-After": "sensitive-upstream-value",
+                },
+                text="<?xml version='1.0'?><rss><channel /></rss>",
+            )
+
+            class Request:
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                def get_res(self, *_args, **_kwargs):
+                    return response
+
+            module.RequestUtils = Request
+            plugin = object.__new__(module.ProwlarrExtend)
+            plugin._config_snapshot = {
+                "host": "https://prowlarr.invalid",
+                "api_key": "not-a-real-key",
+                "proxy": False,
+                "timeout": 9,
+            }
+            site = {"id": 4, "name": "Sample Prowlarr", "domain": "prowlarr_extend.7"}
+
+            # Ordinary search stays fail-closed, including an empty keyword
+            # supplied through the generic search route.
+            self.assertEqual(plugin.search_torrents(site=site, keyword="title"), [])
+            self.assertEqual(plugin.search_torrents(site=site, keyword=None), [])
+
+            with self.assertRaises(module._host_compat.SanitizedUpstreamError) as raised:
+                plugin.refresh_torrents(site=site, keyword=None)
+            self.assertEqual(raised.exception.category, "http_429")
+            self.assertNotIn("sensitive-upstream-value", str(raised.exception))
+
+            with self.assertRaises(module._host_compat.SanitizedUpstreamError):
+                asyncio.run(plugin.async_refresh_torrents(site=site, keyword=None))
+
     def test_torznab_http_json_xml_timeout_empty_and_limits_fail_closed(self):
         with loaded_module() as module:
             plugin = object.__new__(module.ProwlarrExtend)
@@ -480,6 +523,47 @@ class ProwlarrV3ContractTest(unittest.TestCase):
             rendered_logs = "\n".join(_Logger.messages)
             self.assertNotIn("PrivateTitle", rendered_logs)
             self.assertNotIn("sensitive transport detail", rendered_logs)
+
+    def test_torznab_uses_original_content_when_host_text_is_malformed(self):
+        with loaded_module() as module:
+            valid_xml = ("<?xml version='1.0'?><rss><channel>"
+                         "<item><title>Wire Release</title>"
+                         "<enclosure url='https://site/wire.torrent'/>"
+                         "</item></channel></rss>").encode("utf-8")
+            # Parsing the host-provided text would raise ExpatError, while
+            # ``content`` contains the valid original response bytes.
+            response = _Response(
+                headers={"Content-Type": "application/rss+xml"},
+                text="<rss>",
+            )
+            response.content = valid_xml
+            with self.assertRaises(ExpatError):
+                xml.dom.minidom.parseString(response.text)
+
+            class Request:
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                def get_res(self, *_args, **_kwargs):
+                    return response
+
+            module.RequestUtils = Request
+            plugin = object.__new__(module.ProwlarrExtend)
+            plugin._config_snapshot = {
+                "host": "https://prowlarr.invalid",
+                "api_key": "not-a-real-key",
+                "proxy": False,
+                "timeout": 9,
+            }
+
+            results = plugin.search_torrents(
+                {"id": 4, "name": "Wire Site", "domain": "prowlarr_extend.7"},
+                keyword="Wire Release",
+            )
+
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0].title, "Wire Release")
+            self.assertEqual(results[0].enclosure, "https://site/wire.torrent")
 
     def test_service_config_and_diagnostics_are_current_v3_contracts(self):
         with loaded_module() as module:
