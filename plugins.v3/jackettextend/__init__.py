@@ -52,11 +52,11 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.2.15"
+    plugin_version = "3.2.16"
     # 插件作者
-    plugin_author = "jtcymc"
+    plugin_author = "Oexi"
     # 作者主页
-    author_url = "https://github.com/jtcymc"
+    author_url = "https://github.com/Oexi"
     # 插件配置项ID前缀
     plugin_config_prefix = "jackett_extend_"
     # 加载顺序

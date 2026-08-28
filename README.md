@@ -1,46 +1,62 @@
-# MoviePilot 插件
+# MoviePilot Plugins
 
-> **免责声明**  
-> 本项目及其插件仅供学习与交流使用，严禁用于任何商业或非法用途。请遵守当地法律法规，因使用本项目产生的任何后果由使用者自行承担。
+Oexi 独立维护的 MoviePilot 插件仓库，当前仅提供 **MoviePilot V3** 插件。
 
-## 使用说明
-1. 基础参数配置完成点击“保存”，再次点击插件“查看数据”
-2. 复制站点=>MP站点管理=>添加站点=>粘贴到“站点地址”=>保存
-![](https://raw.githubusercontent.com/jtcymc/MoviePilot-PluginsV2/main/docs/imgs/plugins_domains.png)
-![](https://raw.githubusercontent.com/jtcymc/MoviePilot-PluginsV2/main/docs/imgs/add_site.png)
-![](https://raw.githubusercontent.com/jtcymc/MoviePilot-PluginsV2/main/docs/imgs/plugin_site.png)
-## 插件目录
+## 当前插件
 
-### V2 版本插件
+### JackettExtend
 
-#### ProwlarrExtend
-- **插件名称**: ProwlarrExtend
-- **插件描述**: 扩展检索以支持 Prowlarr 站点资源
-- **插件版本**: 1.0
-- **插件作者**: jtcymc
-- **作者主页**: https://github.com/jtcymc
-- **主要功能**:
-  - 支持配置 Prowlarr 服务器信息（地址、API Key、代理等）
-  - 定时获取 Prowlarr 索引器列表
-  - 支持通过 Web 界面配置插件参数
-  - 支持关键字资源搜索
-  - 支持定时任务与手动触发索引器状态获取
-  - 支持多站点资源聚合检索
-- **使用方法**:
-  1. 在插件配置页面填写 Prowlarr 服务器地址、API Key、代理等信息
-  2. 设置定时任务周期，或点击“立即运行一次”手动获取索引器列表
-  3. 插件会自动定时更新索引器列表
-  4. 可在详情页面查看已获取的索引器列表及状态
-- **注意事项**:
-  - 需先在 Prowlarr 中添加并配置好 indexer
-  - 建议先在 Prowlarr 后台测试通过后再在本插件中使用
+- **版本**：3.2.16
+- **适用版本**：MoviePilot V3
+- **作者/维护者**：Oexi
+- **作者主页**：<https://github.com/Oexi>
+- **功能**：
+  - 同步 Jackett 中已配置的 indexer，并在 MoviePilot 中生成对应站点
+  - 支持电影、电视剧和音乐资源搜索
+  - 支持 Jackett 登录密码、代理和搜索超时配置
+  - 支持 indexer 白名单和定时同步
+  - 支持站点状态、索引器类型和搜索结果展示
 
----
+## 安装与配置
 
-如需扩展更多 BT 站点或自定义插件，请参考 `plugins.v2` 目录下的插件实现方式。
+1. 在 MoviePilot V3 的插件市场中添加仓库：
+   `https://github.com/Oexi/MoviePilot-Plugins`
+2. 刷新插件市场并安装 `JackettExtend`。
+3. 打开插件配置，填写：
+   - Jackett 地址
+   - Jackett API Key
+   - （可选）Jackett Web 登录密码
+   - （可选）代理、搜索超时、indexer 白名单和同步周期
+4. 保存配置。插件会同步 Jackett 的 indexer，并将可用站点交给 MoviePilot 管理。
 
----
+Jackett 中应先完成 indexer 的添加和配置。站点同步完成后，可在 MoviePilot 的站点管理中查看和启用对应站点。
 
-如需进一步完善或有特殊格式需求，请告知！
+## 版本说明
 
----
+- 本仓库仅维护 V3 实现，不再提供 MoviePilot V2 插件。
+- V2 版 `ProwlarrExtend` 已移除；当前插件不提供 Prowlarr 适配。
+- `jackett_extend.<indexer>` 是 V3 已使用的虚拟站点标识，升级时会保留该前缀以兼容已有站点数据。
+
+## 目录结构
+
+```text
+plugins.v3/jackettextend/   # JackettExtend V3 插件
+package.v3.json             # V3 插件市场信息
+tests/                      # 自动化测试
+```
+
+## 来源与署名
+
+- **原始项目**：<https://github.com/jtcymc/MoviePilot-PluginsV2>
+- **原仓库作者**：jtcymc
+- **当前仓库维护者**：Oexi
+
+本仓库基于原始项目的早期代码发展，后续代码和维护由 Oexi 独立进行；原始项目作者署名保留用于来源说明。
+
+## 免责声明
+
+本项目及其插件仅供学习和交流使用。请遵守当地法律法规，并自行承担使用本项目产生的责任。请勿将 API Key、密码或其他凭据提交到仓库、日志或公开渠道。
+
+## 许可证
+
+本项目采用 GPL-3.0-or-later，详见 [LICENSE](LICENSE)。
