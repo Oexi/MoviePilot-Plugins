@@ -47,5 +47,18 @@
       "v3.0.0": "适配MoviePilot V3：修复 __update_config 丢失 enabled/proxy 导致重载后静默失效；移除 V3 dataclass 不支持的 imdbid 参数；注册 async_search_torrents 模块（V3 异步搜索链）"
     },
     "system_version": ">=3.0.0"
+  },
+  "ProwlarrExtend": {
+    "name": "ProwlarrExtend",
+    "description": "扩展检索以支持Prowlarr站点资源",
+    "labels": "索引器,Prowlarr",
+    "version": "1.0.0",
+    "icon": "Prowlarr.png",
+    "author": "Oexi",
+    "level": 1,
+    "history": {
+      "v1.0.0": "新增当前 MoviePilot V3 Prowlarr 索引器同步与 Torznab 搜索，并支持与 JackettExtend 安全共存"
+    },
+    "system_version": ">=3.0.0"
   }
 }

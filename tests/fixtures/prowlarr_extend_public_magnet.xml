@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:torznab="http://torznab.com/schemas/2015/feed">
+  <channel>
+    <item>
+      <title>Prowlarr public fixture</title>
+      <guid>magnet:?xt=urn:btih:PROWLARRPUBLICHASH</guid>
+      <link>https://prowlarr.invalid/details/public</link>
+      <comments>https://prowlarr.invalid/details/public</comments>
+      <description>fixture</description>
+      <size>23</size>
+      <enclosure url="magnet:?xt=urn:btih:PROWLARRPUBLICHASH&amp;dn=fixture" length="23" type="application/x-bittorrent" />
+      <torznab:attr name="files" value="23" />
+      <torznab:attr name="magneturl" value="magnet:?xt=urn:btih:PROWLARRPUBLICHASH&amp;dn=fixture" />
+    </item>
+  </channel>
+</rss>

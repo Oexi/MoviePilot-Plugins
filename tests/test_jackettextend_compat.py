@@ -292,11 +292,12 @@ class HostCompatTest(unittest.TestCase):
         )
         self.assertEqual(COMPAT.status()["methods"], COMPAT._METHODS)
 
-    def test_module_reload_uses_new_bridge_token_and_wrapper_closures(self):
+    def test_module_reload_reuses_shared_bridge_wrappers_and_state(self):
         first = Owner("first")
         self.assertTrue(COMPAT.install(first))
         old_sync = self.ChainBase.search_site_torrents
         old_async = self.ChainBase.async_search_site_torrents
+        old_state = getattr(self.ChainBase, COMPAT._STATE_ATTR)
         page_original = inspect.getattr_static(self.ChainBase, "get_search_page_size")
 
         reloaded = load_helper(
@@ -304,8 +305,9 @@ class HostCompatTest(unittest.TestCase):
         )
         second = Owner("second")
         self.assertTrue(reloaded.install(second))
-        self.assertIsNot(self.ChainBase.search_site_torrents, old_sync)
-        self.assertIsNot(self.ChainBase.async_search_site_torrents, old_async)
+        self.assertIs(self.ChainBase.search_site_torrents, old_sync)
+        self.assertIs(self.ChainBase.async_search_site_torrents, old_async)
+        self.assertIs(getattr(self.ChainBase, COMPAT._STATE_ATTR), old_state)
         self.assertIs(
             inspect.getattr_static(self.ChainBase, "get_search_page_size"),
             page_original,

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:torznab="http://torznab.com/schemas/2015/feed">
+  <channel>
+    <item>
+      <title>Prowlarr private fixture</title>
+      <guid>prowlarr-fixture-guid</guid>
+      <link>https://prowlarr.invalid/details/private</link>
+      <comments>https://prowlarr.invalid/details/private</comments>
+      <pubDate>Wed, 01 Jan 2025 00:00:00 GMT</pubDate>
+      <description>fixture</description>
+      <size>123.5</size>
+      <enclosure url="https://prowlarr.invalid/download/private.torrent" length="123" type="application/x-bittorrent" />
+      <torznab:attr name="seeders" value="12" />
+      <torznab:attr name="peers" value="3" />
+      <torznab:attr name="infohash" value="PROWLARRPRIVATEHASH" />
+    </item>
+  </channel>
+</rss>
