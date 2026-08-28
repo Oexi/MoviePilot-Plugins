@@ -6,7 +6,7 @@ MoviePilot 插件仓库，当前仅提供 **MoviePilot V3** 插件。
 
 ### JackettExtend
 
-- **版本**：3.2.16
+- **版本**：3.2.15
 - **适用版本**：MoviePilot V3
 - **原作者**：jtcymc
 - **功能**：
