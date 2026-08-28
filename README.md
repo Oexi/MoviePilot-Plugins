@@ -8,6 +8,7 @@ MoviePilot 插件仓库，当前仅提供 **MoviePilot V3** 插件。
 
 - **版本**：3.2.16
 - **适用版本**：MoviePilot V3
+- **原作者**：jtcymc
 - **功能**：
   - 同步 Jackett 中已配置的 indexer，并在 MoviePilot 中生成对应站点
   - 支持电影、电视剧和音乐资源搜索
