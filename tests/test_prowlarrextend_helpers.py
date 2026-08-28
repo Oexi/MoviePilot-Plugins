@@ -127,6 +127,18 @@ class ProwlarrTorznabHelperTest(unittest.TestCase):
             "magnet:?xt=urn:btih:x",
         )
 
+    def test_current_prowlarr_yts_imdb_attribute_is_canonicalized(self):
+        # Prowlarr's current Newznab response uses ``imdb`` with a numeric,
+        # zero-padded ID; the fixture intentionally contains no live title,
+        # URL, API key, or tracker identity.
+        document = xml.dom.minidom.parse(str(FIXTURES / "prowlarr_extend_yts.xml"))
+        fields = TORZNAB.extract_torznab_item(document.getElementsByTagName("item")[0])
+
+        self.assertEqual(fields["imdbid"], "tt0123456")
+        self.assertEqual(fields["infohash"], "0123456789abcdef0123456789abcdef01234567")
+        self.assertEqual(fields["seeders"], "123")
+        self.assertEqual(fields["peers"], "4")
+
     def test_dedupe_numeric_safety_response_classification_and_redaction(self):
         rows = [
             {"infohash": "ABC", "enclosure": "magnet:?xt=urn:btih:abc", "title": "magnet"},

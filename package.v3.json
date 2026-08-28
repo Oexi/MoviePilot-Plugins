@@ -52,11 +52,12 @@
     "name": "ProwlarrExtend",
     "description": "扩展检索以支持Prowlarr站点资源",
     "labels": "索引器,Prowlarr",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "icon": "Prowlarr.png",
     "author": "Oexi",
     "level": 1,
     "history": {
+      "v1.0.1": "修复 Prowlarr IMDb 身份转换与 FlareSolverr 站点浏览超时，并完善虚拟站点刷新路由",
       "v1.0.0": "新增当前 MoviePilot V3 Prowlarr 索引器同步与 Torznab 搜索，并支持与 JackettExtend 安全共存"
     },
     "system_version": ">=3.0.0"

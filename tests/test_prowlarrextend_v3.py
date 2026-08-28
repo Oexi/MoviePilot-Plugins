@@ -144,14 +144,14 @@ def loaded_module():
 class ProwlarrV3ContractTest(unittest.TestCase):
     def test_metadata_module_and_async_search_contract(self):
         manifest = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["ProwlarrExtend"]["version"], "1.0.0")
+        self.assertEqual(manifest["ProwlarrExtend"]["version"], "1.0.1")
         self.assertEqual(manifest["ProwlarrExtend"]["icon"], "Prowlarr.png")
         self.assertEqual(manifest["ProwlarrExtend"]["author"], "Oexi")
         self.assertEqual(manifest["JackettExtend"]["version"], "3.2.15")
         with loaded_module() as module:
             self.assertEqual(module.ProwlarrExtend.plugin_icon, "Prowlarr.png")
             self.assertEqual(module.ProwlarrExtend.plugin_author, "Oexi")
-            self.assertEqual(module.ProwlarrExtend.plugin_version, "1.0.0")
+            self.assertEqual(module.ProwlarrExtend.plugin_version, "1.0.1")
             self.assertEqual(module.ProwlarrExtend.plugin_config_prefix, "prowlarr_extend_")
 
             plugin = object.__new__(module.ProwlarrExtend)
@@ -222,6 +222,7 @@ class ProwlarrV3ContractTest(unittest.TestCase):
             self.assertEqual(calls[0][1]["timeout"], 17)
             self.assertEqual(calls[0][1]["headers"]["X-Api-Key"], "not-a-real-key")
             self.assertEqual(calls[1][2]["proxies"], module.settings.PROXY if hasattr(module, "settings") else {"http": "http://proxy.invalid"})
+            self.assertTrue(calls[1][2]["raise_exception"])
 
     def test_fetch_http_json_empty_and_bounds_fail_closed(self):
         with loaded_module() as module:
@@ -324,12 +325,98 @@ class ProwlarrV3ContractTest(unittest.TestCase):
             self.assertEqual(query["cat"], ["2000,5010"])
             self.assertNotIn("apikey", calls[1][1].lower())
             self.assertEqual(calls[0][1]["headers"]["X-Api-Key"], "not-a-real-key")
+            self.assertTrue(calls[1][2]["raise_exception"])
 
             calls.clear()
             self.assertEqual(plugin.search_torrents(
                 {"name": "bad", "domain": "prowlarr_extend.0"}, keyword="x"
             ), [])
             self.assertEqual(calls, [])
+
+    def test_yts_numeric_imdb_attr_reaches_moviepilot_identity_fast_path(self):
+        with loaded_module() as module:
+            fixture = (ROOT / "tests" / "fixtures" / "prowlarr_extend_yts.xml").read_text(
+                encoding="utf-8"
+            )
+            response = _Response(
+                headers={"Content-Type": "application/rss+xml"},
+                text=fixture,
+            )
+
+            class Request:
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                def get_res(self, *_args, **_kwargs):
+                    return response
+
+            module.RequestUtils = Request
+            plugin = object.__new__(module.ProwlarrExtend)
+            plugin._config_snapshot = {
+                "host": "https://prowlarr.invalid",
+                "api_key": "not-a-real-key",
+                "proxy": False,
+                "timeout": 12,
+            }
+
+            results = plugin.search_torrents(
+                {"id": 4, "name": "Sample Prowlarr", "domain": "prowlarr_extend.7"},
+                keyword="Sample Film",
+                mtype=types.SimpleNamespace(value="电影", name="MOVIE"),
+            )
+
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0].media_source, module.MediaSource.IMDb)
+            self.assertEqual(results[0].media_id, "tt0123456")
+            self.assertEqual(results[0].category, "电影")
+            self.assertEqual(results[0].size, 734003200.0)
+
+            # Model the current MoviePilot SearchChain identity branch.  Keep
+            # the title fallback deliberately false: a canonical IMDb ID must
+            # still admit the release when title parsing cannot do so.
+            target_media_source = module.MediaSource.IMDb
+            target_media_id = "tt0123456"
+            title_fallback_matches = "Different Target" in results[0].title
+            identity_fast_path_matches = bool(
+                results[0].media_source == target_media_source
+                and target_media_id
+                and results[0].media_id == target_media_id
+            )
+            self.assertFalse(title_fallback_matches)
+            self.assertTrue(identity_fast_path_matches)
+
+    def test_empty_site_browse_has_bounded_flaresolverr_budget(self):
+        with loaded_module() as module:
+            timeouts = []
+
+            class Request:
+                def __init__(self, *args, **kwargs):
+                    timeouts.append(kwargs.get("timeout"))
+
+                def get_res(self, *_args, **_kwargs):
+                    return _Response(
+                        headers={"Content-Type": "application/rss+xml"},
+                        text="<?xml version='1.0'?><rss><channel /></rss>",
+                    )
+
+            module.RequestUtils = Request
+            plugin = object.__new__(module.ProwlarrExtend)
+            plugin._config_snapshot = {
+                "host": "https://prowlarr.invalid",
+                "api_key": "not-a-real-key",
+                "proxy": False,
+                "timeout": 12,
+            }
+            site = {"id": 4, "name": "Sample Prowlarr", "domain": "prowlarr_extend.7"}
+
+            result = asyncio.run(plugin.async_refresh_torrents(site=site, keyword=None))
+
+            self.assertEqual(result, [])
+            self.assertEqual(timeouts, [module.ProwlarrExtend.BROWSE_TIMEOUT_MIN])
+
+            timeouts.clear()
+            plugin.search_torrents(site=site, keyword="Sample Film")
+            self.assertEqual(timeouts, [12])
 
     def test_torznab_http_json_xml_timeout_empty_and_limits_fail_closed(self):
         with loaded_module() as module:

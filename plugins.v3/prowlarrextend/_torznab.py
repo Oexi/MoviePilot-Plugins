@@ -314,8 +314,16 @@ def extract_torznab_item(item: object) -> dict:
             fields["uploadvolumefactor"] = value
         elif name == "hit_and_run":
             fields["hit_and_run"] = str(value).strip().lower() in ("1", "true", "yes")
-        elif name == "imdbid":
-            fields["imdbid"] = normalize_imdbid(value)
+        elif name in ("imdb", "imdbid"):
+            # Prowlarr's current Newznab serializer emits ReleaseInfo.ImdbId
+            # as the seven-digit numeric ``imdb`` attribute (for example
+            # ``0123456``), whereas many direct Torznab feeds use the
+            # ``imdbid`` spelling with the canonical ``tt0123456`` value.
+            # Normalize both forms before handing the identity to the host.
+            imdb_value = str(value or "").strip().lower()
+            if name == "imdb" and re.fullmatch(r"[0-9]{7,}", imdb_value):
+                imdb_value = f"tt{imdb_value}"
+            fields["imdbid"] = normalize_imdbid(imdb_value)
         elif name in ("infohash", "info_hash"):
             fields["infohash"] = str(value).strip()
         elif name == "magneturl":

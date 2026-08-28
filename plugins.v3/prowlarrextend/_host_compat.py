@@ -8,8 +8,10 @@ bridge therefore stores one shared state dictionary on ``ChainBase`` and
 keeps one owner record per key in that dictionary.  Module copies only add or
 remove their record; they never install a second layer of wrappers.
 
-Only the two per-site search boundaries are wrapped.  The host's global
-plugin route, ordinary-site route and page-size calculation remain host-owned.
+The two per-site search boundaries are always wrapped, and the independent
+sync/async refresh boundaries are wrapped when the host exposes them.  The
+host's global plugin route, ordinary-site route and page-size calculation
+remain host-owned.
 """
 
 import functools
@@ -32,7 +34,7 @@ _STATE_ATTR = "__jackett_extend_host_compat_state__"
 # The ABI marker must be a process-stable value.  A module-local object (the
 # old implementation's token) makes every module reload look incompatible and
 # causes the second copy to tear down the first copy's bridge.
-_BRIDGE_ABI = 3
+_BRIDGE_ABI = 4
 _BRIDGE_ID = "jackett_extend_host_compat"
 # Keep the old name available for callers/tests that inspected it.  It is a
 # value, not an identity token, and is intentionally equal in every module
@@ -43,6 +45,30 @@ _METHODS = (
     "search_site_torrents",
     "async_search_site_torrents",
 )
+
+# Refresh is a separate host boundary from ordinary search.  Older V3 hosts
+# may not expose one or both refresh methods, so they are discovered
+# opportunistically when the bridge is installed.  Keep ``_METHODS`` as the
+# required search contract for source compatibility with existing callers.
+_OPTIONAL_METHODS = (
+    "refresh_torrents",
+    "async_refresh_torrents",
+)
+_ALL_METHODS = _METHODS + _OPTIONAL_METHODS
+
+# The plugin modules expose refresh through their module map rather than a
+# synchronous instance method.  Prefer a dedicated refresh implementation when
+# an integration has one, then use the ordinary search implementation as the
+# compatibility fallback used by JackettExtend/ProwlarrExtend.
+_OWNER_METHODS = {
+    "search_site_torrents": ("search_torrents",),
+    "async_search_site_torrents": ("async_search_torrents",),
+    "refresh_torrents": ("refresh_torrents", "search_torrents"),
+    "async_refresh_torrents": (
+        "async_refresh_torrents",
+        "async_search_torrents",
+    ),
+}
 
 # ``None`` historically meant the one plugin owner.  Keep a fixed key for
 # that API so a reload replaces the old default owner rather than leaving it
@@ -295,11 +321,30 @@ def _owner_for_site(state: Mapping, site: object) -> Any:
     return None
 
 
-def _call_owner(owner: object, method: str, args: tuple, kwargs: dict):
-    return getattr(owner, method)(*args, **kwargs)
+def _owner_methods(method: object) -> tuple:
+    """Normalize a route's preferred owner method names."""
+    if isinstance(method, str):
+        return (method,)
+    try:
+        return tuple(method)
+    except TypeError:
+        return ()
 
 
-async def _call_owner_async(owner: object, method: str, args: tuple, kwargs: dict):
+def _call_owner(owner: object, method: object, args: tuple, kwargs: dict):
+    """Call the first available owner method without masking its errors."""
+    methods = _owner_methods(method)
+    for name in methods:
+        try:
+            candidate = getattr(owner, name)
+        except AttributeError:
+            continue
+        if callable(candidate):
+            return candidate(*args, **kwargs)
+    raise AttributeError(f"owner has no callable method in {methods!r}")
+
+
+async def _call_owner_async(owner: object, method: object, args: tuple, kwargs: dict):
     result = _call_owner(owner, method, args, kwargs)
     if inspect.isawaitable(result):
         return await result
@@ -313,14 +358,19 @@ def _site_from_call(args: tuple, kwargs: dict):
     return args[1] if len(args) > 1 else None
 
 
-def _make_sync_wrapper(original, state):
+def _make_sync_wrapper(original, state, route: str = "search_site_torrents"):
     @functools.wraps(original)
     def wrapper(*args, **kwargs):
         site = _site_from_call(args, kwargs)
         owner = _owner_for_site(state, site)
         if owner is not None:
             try:
-                return _call_owner(owner, "search_torrents", args[1:], kwargs)
+                return _call_owner(
+                    owner,
+                    _OWNER_METHODS.get(route, ("search_torrents",)),
+                    args[1:],
+                    kwargs,
+                )
             except Exception:
                 # A plugin module must not break the host's ordinary search
                 # chain.  BaseException (including cancellation) is allowed
@@ -332,14 +382,19 @@ def _make_sync_wrapper(original, state):
     return wrapper
 
 
-def _make_async_wrapper(original, state):
+def _make_async_wrapper(original, state, route: str = "async_search_site_torrents"):
     @functools.wraps(original)
     async def wrapper(*args, **kwargs):
         site = _site_from_call(args, kwargs)
         owner = _owner_for_site(state, site)
         if owner is not None:
             try:
-                return await _call_owner_async(owner, "async_search_torrents", args[1:], kwargs)
+                return await _call_owner_async(
+                    owner,
+                    _OWNER_METHODS.get(route, ("async_search_torrents",)),
+                    args[1:],
+                    kwargs,
+                )
             except Exception:
                 pass
         result = original(*args, **kwargs)
@@ -375,7 +430,7 @@ def _restore(chain_base: type, state: Mapping) -> bool:
     """Retire a state and restore only attributes still owned by its bridge.
 
     The method list comes from the state itself so a new module can safely
-    migrate a prior three-method snapshot (including its page-size wrapper).
+    migrate a prior snapshot, including older page-size or refresh wrappers.
     A third-party replacement is left untouched rather than being overwritten.
     """
     lock = _state_lock(state)
@@ -424,8 +479,14 @@ def _state_is_current(chain_base: type, state: Mapping) -> bool:
     if (
         state.get("abi") != _BRIDGE_ABI
         or state.get("bridge_id") != _BRIDGE_ID
-        or tuple(state.get("methods") or ()) != _METHODS
         or not state.get("active", True)
+    ):
+        return False
+    methods = tuple(state.get("methods") or ())
+    if (
+        not methods
+        or any(name not in _ALL_METHODS for name in methods)
+        or not all(name in methods for name in _METHODS)
     ):
         return False
     owners = state.get("owners")
@@ -437,7 +498,7 @@ def _state_is_current(chain_base: type, state: Mapping) -> bool:
     return all(
         name in wrappers
         and _current_descriptor(chain_base, name) is wrappers[name]
-        for name in _METHODS
+        for name in methods
     )
 
 
@@ -625,7 +686,12 @@ def _new_state(
     owner_key: Any,
     legacy_owners=(),
 ):
-    if not all(callable(getattr(chain_base, name, None)) for name in _METHODS):
+    methods = tuple(
+        name
+        for name in _ALL_METHODS
+        if callable(getattr(chain_base, name, None))
+    )
+    if not all(name in methods for name in _METHODS):
         return None
     state = {
         "abi": _BRIDGE_ABI,
@@ -634,7 +700,7 @@ def _new_state(
         # diagnostics/migrations; independent copies deliberately compare the
         # value, never object identity.
         "module_token": _BRIDGE_TOKEN,
-        "methods": _METHODS,
+        "methods": methods,
         "active": True,
         "generation": 0,
         "lock": threading.RLock(),
@@ -653,16 +719,20 @@ def _new_state(
         if not _register_owner(state, plugin, predicate, owner_key):
             return None
         try:
-            for name in _METHODS:
+            for name in methods:
                 state["originals"][name] = inspect.getattr_static(chain_base, name)
                 state["defined_here"][name] = name in getattr(chain_base, "__dict__", {})
             state["wrappers"] = {
-                "search_site_torrents": _make_sync_wrapper(
-                    state["originals"]["search_site_torrents"], state
-                ),
-                "async_search_site_torrents": _make_async_wrapper(
-                    state["originals"]["async_search_site_torrents"], state
-                ),
+                name: (
+                    _make_async_wrapper(
+                        state["originals"][name], state, name
+                    )
+                    if name.startswith("async_")
+                    else _make_sync_wrapper(
+                        state["originals"][name], state, name
+                    )
+                )
+                for name in methods
             }
             for name, wrapper in state["wrappers"].items():
                 setattr(chain_base, name, wrapper)
@@ -812,7 +882,7 @@ def status() -> dict:
             "owner_alive": active and owner_alive,
             "owner_keys": owner_keys,
             "owners": len(owner_keys),
-            "methods": tuple(_METHODS),
+            "methods": tuple(state.get("methods") or ()),
         }
 
 

@@ -54,7 +54,7 @@ class ProwlarrExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Prowlarr.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     # 插件作者
     plugin_author = "Oexi"
     # 作者主页
@@ -72,6 +72,12 @@ class ProwlarrExtend(_PluginBase):
     SEARCH_TIMEOUT_DEFAULT = 30
     SEARCH_TIMEOUT_MIN = 5
     SEARCH_TIMEOUT_MAX = 120
+    # Prowlarr's official FlareSolverr integration defaults to a 60-second
+    # solve budget and gives its own HTTP request another five seconds.  Site
+    # management browses with an empty query, so allow that specific path to
+    # finish while keeping ordinary title searches on the configured timeout.
+    # The request remains bounded and runs in ``asyncio.to_thread``.
+    BROWSE_TIMEOUT_MIN = 70
     REST_MAX_JSON_BYTES = 4 * 1024 * 1024
     REST_MAX_ITEMS = 5000
     TORZNAB_MAX_XML_BYTES = 8 * 1024 * 1024
@@ -1030,7 +1036,8 @@ class ProwlarrExtend(_PluginBase):
             indexer_query_url = f"{host}/api/v1/indexer"
             ret = RequestUtils(headers=headers, timeout=timeout).get_res(
                 indexer_query_url,
-                proxies=getattr(settings, "PROXY", None) if proxy else None
+                proxies=getattr(settings, "PROXY", None) if proxy else None,
+                raise_exception=True,
             )
 
             # E3: 校验状态码/Content-Type/数据类型,json 只解析一次
@@ -1254,6 +1261,8 @@ class ProwlarrExtend(_PluginBase):
         request_timeout = self._normalize_timeout(
             request_config.get("timeout", getattr(self, "_timeout", self.SEARCH_TIMEOUT_DEFAULT))
         )
+        if not keyword:
+            request_timeout = max(request_timeout, self.BROWSE_TIMEOUT_MIN)
         request_proxy = bool(request_config.get("proxy", getattr(self, "_proxy", False)))
         try:
             headers = {
@@ -1262,7 +1271,9 @@ class ProwlarrExtend(_PluginBase):
                 "Accept": "application/xml, application/rss+xml, text/xml, */*",
             }
             ret = RequestUtils(headers=headers, timeout=request_timeout).get_res(
-                url, proxies=getattr(settings, "PROXY", None) if request_proxy else None
+                url,
+                proxies=getattr(settings, "PROXY", None) if request_proxy else None,
+                raise_exception=True,
             )
         except (requests.Timeout, TimeoutError):
             self._record_error("timeout", source="search")
