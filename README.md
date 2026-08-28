@@ -1,6 +1,6 @@
 # MoviePilot Plugins
 
-Oexi 独立维护的 MoviePilot 插件仓库，当前仅提供 **MoviePilot V3** 插件。
+MoviePilot 插件仓库，当前仅提供 **MoviePilot V3** 插件。
 
 ## 当前插件
 
@@ -8,8 +8,6 @@ Oexi 独立维护的 MoviePilot 插件仓库，当前仅提供 **MoviePilot V3**
 
 - **版本**：3.2.16
 - **适用版本**：MoviePilot V3
-- **作者/维护者**：Oexi
-- **作者主页**：<https://github.com/Oexi>
 - **功能**：
   - 同步 Jackett 中已配置的 indexer，并在 MoviePilot 中生成对应站点
   - 支持电影、电视剧和音乐资源搜索
@@ -44,14 +42,6 @@ plugins.v3/jackettextend/   # JackettExtend V3 插件
 package.v3.json             # V3 插件市场信息
 tests/                      # 自动化测试
 ```
-
-## 来源与署名
-
-- **原始项目**：<https://github.com/jtcymc/MoviePilot-PluginsV2>
-- **原仓库作者**：jtcymc
-- **当前仓库维护者**：Oexi
-
-本仓库基于原始项目的早期代码发展，后续代码和维护由 Oexi 独立进行；原始项目作者署名保留用于来源说明。
 
 ## 免责声明
 
