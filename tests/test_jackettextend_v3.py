@@ -1515,6 +1515,134 @@ class JackettSyncBoundaryTest(unittest.TestCase):
                 [("SiteDeleted", {"site_id": 1})],
             )
 
+    def test_lifecycle_cleanup_deletes_only_jackett_sites_and_is_idempotent(self):
+        with loaded_module() as module:
+            records = [
+                types.SimpleNamespace(id=1, domain="jackett_extend.old"),
+                types.SimpleNamespace(id=2, domain="ordinary.example"),
+                types.SimpleNamespace(id=3, domain="prowlarr_extend.7"),
+            ]
+            state = types.SimpleNamespace(deleted=[])
+
+            class FakeSiteOper:
+                def list(self):
+                    return [record for record in records if record.id not in state.deleted]
+
+                def delete(self, site_id):
+                    state.deleted.append(site_id)
+
+            eventmanager, events = self._event_manager()
+            event_type = types.SimpleNamespace(SiteDeleted="SiteDeleted")
+            plugin = object.__new__(module.JackettExtend)
+
+            with site_oper_modules(
+                FakeSiteOper,
+                eventmanager=eventmanager,
+                event_type=event_type,
+            ):
+                self.assertTrue(plugin._JackettExtend__remove_managed_sites())
+                self.assertTrue(plugin._JackettExtend__remove_managed_sites())
+
+            self.assertEqual(state.deleted, [1])
+            self.assertEqual(
+                events.calls,
+                [("SiteDeleted", {"site_id": 1})],
+            )
+
+    def test_lifecycle_cleanup_contains_row_and_event_failures(self):
+        with loaded_module() as module:
+            records = [
+                types.SimpleNamespace(id=1, domain="jackett_extend.first"),
+                types.SimpleNamespace(id=2, domain="jackett_extend.second"),
+                types.SimpleNamespace(id=3, domain="jackett_extend.third"),
+            ]
+            state = types.SimpleNamespace(deleted=[])
+
+            class FakeSiteOper:
+                def list(self):
+                    return records
+
+                def delete(self, site_id):
+                    if site_id == 2:
+                        raise RuntimeError("delete unavailable")
+                    state.deleted.append(site_id)
+
+            events = types.SimpleNamespace(calls=[])
+
+            class EventManager:
+                def send_event(self, event, payload):
+                    events.calls.append((event, payload))
+                    if payload["site_id"] == 3:
+                        raise RuntimeError("event unavailable")
+
+            event_type = types.SimpleNamespace(SiteDeleted="SiteDeleted")
+            plugin = object.__new__(module.JackettExtend)
+
+            with site_oper_modules(FakeSiteOper, EventManager(), event_type):
+                result = plugin._JackettExtend__remove_managed_sites()
+
+            self.assertFalse(result)
+            self.assertEqual(state.deleted, [1, 3])
+            self.assertEqual(events.calls, [
+                ("SiteDeleted", {"site_id": 1}),
+                ("SiteDeleted", {"site_id": 3}),
+            ])
+
+    def test_disabled_init_cleans_sites_without_network_sync(self):
+        with loaded_module() as module:
+            records = [
+                types.SimpleNamespace(id=1, domain="jackett_extend.nyaa"),
+                types.SimpleNamespace(id=2, domain="ordinary.example"),
+            ]
+            state = types.SimpleNamespace(deleted=[])
+
+            class FakeSiteOper:
+                def list(self):
+                    return [record for record in records if record.id not in state.deleted]
+
+                def delete(self, site_id):
+                    state.deleted.append(site_id)
+
+            eventmanager, events = self._event_manager()
+            event_type = types.SimpleNamespace(SiteDeleted="SiteDeleted")
+            plugin = object.__new__(module.JackettExtend)
+
+            with site_oper_modules(FakeSiteOper, eventmanager, event_type):
+                plugin.init_plugin({"enabled": False})
+
+            self.assertFalse(plugin.get_state())
+            self.assertEqual(state.deleted, [1])
+            self.assertEqual(events.calls, [
+                ("SiteDeleted", {"site_id": 1}),
+            ])
+
+    def test_stop_service_cleans_sites_and_marks_plugin_disabled(self):
+        with loaded_module() as module:
+            records = [types.SimpleNamespace(id=1, domain="jackett_extend.nyaa")]
+            state = types.SimpleNamespace(deleted=[])
+
+            class FakeSiteOper:
+                def list(self):
+                    return [record for record in records if record.id not in state.deleted]
+
+                def delete(self, site_id):
+                    state.deleted.append(site_id)
+
+            eventmanager, events = self._event_manager()
+            event_type = types.SimpleNamespace(SiteDeleted="SiteDeleted")
+            plugin = object.__new__(module.JackettExtend)
+            plugin._enabled = True
+
+            with site_oper_modules(FakeSiteOper, eventmanager, event_type):
+                result = plugin.stop_service()
+
+            self.assertTrue(result)
+            self.assertFalse(plugin.get_state())
+            self.assertEqual(state.deleted, [1])
+            self.assertEqual(events.calls, [
+                ("SiteDeleted", {"site_id": 1}),
+            ])
+
     def test_reload_uses_real_stop_and_replaces_generation_event(self):
         with loaded_module() as module:
             class FakeCronTrigger:
@@ -1549,6 +1677,8 @@ class JackettSyncBoundaryTest(unittest.TestCase):
                 current_thread=threading.current_thread,
             )
             plugin = object.__new__(module.JackettExtend)
+            cleanup_calls = []
+            plugin._JackettExtend__remove_managed_sites = lambda: cleanup_calls.append(True)
 
             plugin.init_plugin({
                 "enabled": True,
@@ -1575,9 +1705,11 @@ class JackettSyncBoundaryTest(unittest.TestCase):
             self.assertEqual(len(created), 2)
             self.assertTrue(created[1].started)
             self.assertEqual(created[1].kwargs, {"generation": second_generation})
+            self.assertEqual(cleanup_calls, [])
 
             plugin.stop_service()
             self.assertTrue(second_event.is_set())
+            self.assertEqual(cleanup_calls, [True])
 
 
 if __name__ == "__main__":

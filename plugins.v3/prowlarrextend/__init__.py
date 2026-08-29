@@ -54,7 +54,7 @@ class ProwlarrExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Prowlarr.png"
     # 插件版本
-    plugin_version = "1.0.2"
+    plugin_version = "1.0.3"
     # 插件作者
     plugin_author = "Oexi"
     # 作者主页
@@ -129,10 +129,10 @@ class ProwlarrExtend(_PluginBase):
         """
         初始化插件
         """
-        # Stop the previous instance before replacing any shared configuration.
-        # This prevents an in-flight worker from using a new host/key and
-        # mutating the new instance's site state.
-        self.stop_service()
+        # Stop only the previous runtime before replacing shared configuration.
+        # Lifecycle cleanup belongs to public stop_service(); doing it here
+        # would delete sites during an enabled -> enabled configuration reload.
+        self._stop_runtime()
 
         # All replacement of configuration/state is serialized with the
         # short commit phase.  A previous-generation worker may still be finishing a DB/event
@@ -211,10 +211,9 @@ class ProwlarrExtend(_PluginBase):
             # while its request is in flight.
             self._config_snapshot = self._capture_config_snapshot_locked()
         if not self._enabled:
-            # The V3 search bridge is owned by the plugin lifecycle, not
-            # by module import.  Disabled/reloaded instances must release a
-            # patch only when they are still the current owner.
-            _host_compat.uninstall(self, owner_key=self._bridge_owner_key)
+            # A direct disabled initialization must also converge persisted
+            # sites when the host does not call stop_service() first.
+            self.__remove_managed_sites()
             return
 
         # Install after the new configuration snapshot is published, so a
@@ -607,10 +606,8 @@ class ProwlarrExtend(_PluginBase):
                 },
             }]
 
-    def stop_service(self):
-        """
-        退出插件
-        """
+    def _stop_runtime(self):
+        """Stop runtime resources without deleting persisted site rows."""
         _host_compat.uninstall(self, owner_key=self._bridge_owner_key)
         event = getattr(self, "_sync_stop_event", None)
         if event is not None:
@@ -623,6 +620,58 @@ class ProwlarrExtend(_PluginBase):
             # the generation/event before every state-changing operation.
             thread.join(timeout=0.2)
         self._sync_thread = None
+
+    def stop_service(self):
+        """Stop runtime resources and remove this plugin's persisted sites."""
+        self._stop_runtime()
+        with self._sync_lock:
+            with self._state_lock:
+                self._enabled = False
+            return self.__remove_managed_sites()
+
+    def __remove_managed_sites(self):
+        """Remove only persisted sites in ProwlarrExtend's reserved namespace."""
+        with self._sync_lock:
+            try:
+                from app.db.oper.site import SiteOper
+                from app.schemas.types import EventType
+                from app.sdk.events import eventmanager
+
+                site_oper = SiteOper()
+                removed = 0
+                failed = 0
+                for site in site_oper.list():
+                    site_domain = str(getattr(site, "domain", "") or "").strip().lower()
+                    if not self._indexer_id_from_domain(site_domain):
+                        continue
+                    try:
+                        site_oper.delete(site.id)
+                    except Exception as error:  # noqa: BLE001 - isolate rows
+                        failed += 1
+                        logger.warning(
+                            f"【{self.plugin_name}】生命周期删除站点失败：{type(error).__name__}"
+                        )
+                        continue
+                    removed += 1
+                    try:
+                        eventmanager.send_event(
+                            EventType.SiteDeleted,
+                            {"site_id": site.id},
+                        )
+                    except Exception as error:  # noqa: BLE001 - DB delete succeeded
+                        failed += 1
+                        logger.warning(
+                            f"【{self.plugin_name}】发送 SiteDeleted 事件失败：{type(error).__name__}"
+                        )
+                logger.info(
+                    f"【{self.plugin_name}】生命周期站点清理完成：删除 {removed} 条，失败 {failed} 条"
+                )
+                return failed == 0
+            except Exception as error:  # noqa: BLE001 - lifecycle boundary
+                logger.error(
+                    f"【{self.plugin_name}】生命周期站点清理失败：{type(error).__name__}"
+                )
+                return False
 
     def __update_config(self, generation: Optional[int] = None):
         """

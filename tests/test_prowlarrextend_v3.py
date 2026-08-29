@@ -143,17 +143,89 @@ def loaded_module():
                 sys.modules.pop(name, None)
 
 
+@contextmanager
+def site_oper_modules(site_oper, eventmanager, event_type):
+    """Install isolated current V3 DB/event import shims."""
+    names = [
+        "app",
+        "app.db",
+        "app.db.oper",
+        "app.db.oper.site",
+        "app.sdk",
+        "app.sdk.events",
+        "app.schemas",
+        "app.schemas.types",
+    ]
+    previous = {name: sys.modules.get(name) for name in names}
+    parents = {
+        name: sys.modules.get(name)
+        for name in ("app", "app.db", "app.db.oper", "app.sdk", "app.schemas")
+    }
+    previous_attrs = {
+        (name, "__path__"): getattr(module, "__path__", None)
+        for name, module in parents.items()
+        if module is not None
+    }
+
+    app = sys.modules.get("app") or types.ModuleType("app")
+    app.__path__ = []
+    db = types.ModuleType("app.db")
+    db.__path__ = []
+    oper = types.ModuleType("app.db.oper")
+    oper.__path__ = []
+    site = types.ModuleType("app.db.oper.site")
+    site.SiteOper = site_oper
+    sdk = sys.modules.get("app.sdk") or types.ModuleType("app.sdk")
+    sdk.__path__ = []
+    events = types.ModuleType("app.sdk.events")
+    events.eventmanager = eventmanager
+    schemas = sys.modules.get("app.schemas") or types.ModuleType("app.schemas")
+    schemas.__path__ = []
+    event_types = types.ModuleType("app.schemas.types")
+    event_types.EventType = event_type
+    sys.modules.update({
+        "app": app,
+        "app.db": db,
+        "app.db.oper": oper,
+        "app.db.oper.site": site,
+        "app.sdk": sdk,
+        "app.sdk.events": events,
+        "app.schemas": schemas,
+        "app.schemas.types": event_types,
+    })
+
+    try:
+        yield
+    finally:
+        for name, previous_module in previous.items():
+            if previous_module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous_module
+        for (parent_name, attr), value in previous_attrs.items():
+            parent = sys.modules.get(parent_name)
+            if parent is None:
+                continue
+            if value is None:
+                try:
+                    delattr(parent, attr)
+                except AttributeError:
+                    pass
+            else:
+                setattr(parent, attr, value)
+
+
 class ProwlarrV3ContractTest(unittest.TestCase):
     def test_metadata_module_and_async_search_contract(self):
         manifest = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["ProwlarrExtend"]["version"], "1.0.2")
+        self.assertEqual(manifest["ProwlarrExtend"]["version"], "1.0.3")
         self.assertEqual(manifest["ProwlarrExtend"]["icon"], "Prowlarr.png")
         self.assertEqual(manifest["ProwlarrExtend"]["author"], "Oexi")
-        self.assertEqual(manifest["JackettExtend"]["version"], "3.2.15")
+        self.assertEqual(manifest["JackettExtend"]["version"], "3.2.16")
         with loaded_module() as module:
             self.assertEqual(module.ProwlarrExtend.plugin_icon, "Prowlarr.png")
             self.assertEqual(module.ProwlarrExtend.plugin_author, "Oexi")
-            self.assertEqual(module.ProwlarrExtend.plugin_version, "1.0.2")
+            self.assertEqual(module.ProwlarrExtend.plugin_version, "1.0.3")
             self.assertEqual(module.ProwlarrExtend.plugin_config_prefix, "prowlarr_extend_")
 
             plugin = object.__new__(module.ProwlarrExtend)
@@ -596,6 +668,142 @@ class ProwlarrV3ContractTest(unittest.TestCase):
 
             plugin._enabled = False
             self.assertEqual(plugin.get_service(), [])
+
+    def test_lifecycle_cleanup_deletes_only_prowlarr_sites_and_is_idempotent(self):
+        with loaded_module() as module:
+            records = [
+                types.SimpleNamespace(id=1, domain="prowlarr_extend.7"),
+                types.SimpleNamespace(id=2, domain="ordinary.example"),
+                types.SimpleNamespace(id=3, domain="jackett_extend.old"),
+            ]
+            state = types.SimpleNamespace(deleted=[])
+
+            class FakeSiteOper:
+                def list(self):
+                    return [record for record in records if record.id not in state.deleted]
+
+                def delete(self, site_id):
+                    state.deleted.append(site_id)
+
+            calls = []
+
+            class EventManager:
+                def send_event(self, event, payload):
+                    calls.append((event, payload))
+
+            event_type = types.SimpleNamespace(SiteDeleted="SiteDeleted")
+            plugin = object.__new__(module.ProwlarrExtend)
+
+            with site_oper_modules(FakeSiteOper, EventManager(), event_type):
+                self.assertTrue(plugin._ProwlarrExtend__remove_managed_sites())
+                self.assertTrue(plugin._ProwlarrExtend__remove_managed_sites())
+
+            self.assertEqual(state.deleted, [1])
+            self.assertEqual(calls, [("SiteDeleted", {"site_id": 1})])
+
+    def test_lifecycle_cleanup_contains_row_and_event_failures(self):
+        with loaded_module() as module:
+            records = [
+                types.SimpleNamespace(id=1, domain="prowlarr_extend.7"),
+                types.SimpleNamespace(id=2, domain="prowlarr_extend.8"),
+                types.SimpleNamespace(id=3, domain="prowlarr_extend.9"),
+            ]
+            state = types.SimpleNamespace(deleted=[])
+
+            class FakeSiteOper:
+                def list(self):
+                    return records
+
+                def delete(self, site_id):
+                    if site_id == 2:
+                        raise RuntimeError("delete unavailable")
+                    state.deleted.append(site_id)
+
+            calls = []
+
+            class EventManager:
+                def send_event(self, event, payload):
+                    calls.append((event, payload))
+                    if payload["site_id"] == 3:
+                        raise RuntimeError("event unavailable")
+
+            event_type = types.SimpleNamespace(SiteDeleted="SiteDeleted")
+            plugin = object.__new__(module.ProwlarrExtend)
+
+            with site_oper_modules(FakeSiteOper, EventManager(), event_type):
+                result = plugin._ProwlarrExtend__remove_managed_sites()
+
+            self.assertFalse(result)
+            self.assertEqual(state.deleted, [1, 3])
+            self.assertEqual(calls, [
+                ("SiteDeleted", {"site_id": 1}),
+                ("SiteDeleted", {"site_id": 3}),
+            ])
+
+    def test_disabled_init_cleans_sites_without_network_sync(self):
+        with loaded_module() as module:
+            records = [
+                types.SimpleNamespace(id=1, domain="prowlarr_extend.7"),
+                types.SimpleNamespace(id=2, domain="ordinary.example"),
+            ]
+            state = types.SimpleNamespace(deleted=[])
+
+            class FakeSiteOper:
+                def list(self):
+                    return [record for record in records if record.id not in state.deleted]
+
+                def delete(self, site_id):
+                    state.deleted.append(site_id)
+
+            calls = []
+
+            class EventManager:
+                def send_event(self, event, payload):
+                    calls.append((event, payload))
+
+            event_type = types.SimpleNamespace(SiteDeleted="SiteDeleted")
+            plugin = object.__new__(module.ProwlarrExtend)
+
+            with site_oper_modules(FakeSiteOper, EventManager(), event_type):
+                plugin.init_plugin({"enabled": False})
+
+            self.assertFalse(plugin.get_state())
+            self.assertEqual(state.deleted, [1])
+            self.assertEqual(calls, [
+                ("SiteDeleted", {"site_id": 1}),
+            ])
+
+    def test_stop_service_cleans_sites_and_marks_plugin_disabled(self):
+        with loaded_module() as module:
+            records = [types.SimpleNamespace(id=1, domain="prowlarr_extend.7")]
+            state = types.SimpleNamespace(deleted=[])
+
+            class FakeSiteOper:
+                def list(self):
+                    return [record for record in records if record.id not in state.deleted]
+
+                def delete(self, site_id):
+                    state.deleted.append(site_id)
+
+            calls = []
+
+            class EventManager:
+                def send_event(self, event, payload):
+                    calls.append((event, payload))
+
+            event_type = types.SimpleNamespace(SiteDeleted="SiteDeleted")
+            plugin = object.__new__(module.ProwlarrExtend)
+            plugin._enabled = True
+
+            with site_oper_modules(FakeSiteOper, EventManager(), event_type):
+                result = plugin.stop_service()
+
+            self.assertTrue(result)
+            self.assertFalse(plugin.get_state())
+            self.assertEqual(state.deleted, [1])
+            self.assertEqual(calls, [
+                ("SiteDeleted", {"site_id": 1}),
+            ])
 
 
 if __name__ == "__main__":
