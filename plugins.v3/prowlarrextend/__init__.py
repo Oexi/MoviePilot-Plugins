@@ -57,9 +57,9 @@ class ProwlarrExtend(_PluginBase):
     # 插件版本
     plugin_version = "1.0.4"
     # 插件作者
-    plugin_author = "Oexi"
+    plugin_author = "oexi"
     # 作者主页
-    author_url = "https://github.com/Oexi"
+    author_url = "https://github.com/oexi"
     # 插件配置项ID前缀
     plugin_config_prefix = "prowlarr_extend_"
     # 加载顺序
