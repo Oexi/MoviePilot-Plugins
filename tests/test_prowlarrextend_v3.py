@@ -43,8 +43,15 @@ class _TorrentInfo:
 
 
 class _StringUtils:
+    clear_calls = []
+
     @staticmethod
     def clear(text, replace_word="", allow_space=False):
+        _StringUtils.clear_calls.append((text, replace_word, allow_space))
+        if text == "Test123, S!":
+            return "Test123 S"
+        if text == "落第賢者の学院無双 ~二度目の転生、Sランクチート魔術師冒険録~":
+            return "落第賢者の学院無双 二度目の転生 Sランクチート魔術師冒険録"
         return text
 
     @staticmethod
@@ -406,6 +413,88 @@ class ProwlarrV3ContractTest(unittest.TestCase):
                 {"name": "bad", "domain": "prowlarr_extend.0"}, keyword="x"
             ), [])
             self.assertEqual(calls, [])
+
+    def test_search_nfkc_normalizes_full_width_keyword_before_cleaning_and_query(self):
+        _StringUtils.clear_calls.clear()
+        with loaded_module() as module:
+            calls = []
+
+            class Request:
+                def __init__(self, *args, **kwargs):
+                    calls.append(("init", kwargs))
+
+                def get_res(self, url, **kwargs):
+                    calls.append(("get", url, kwargs))
+                    return _Response(
+                        headers={"Content-Type": "application/rss+xml"},
+                        text="<?xml version='1.0'?><rss><channel /></rss>",
+                    )
+
+            module.RequestUtils = Request
+            plugin = object.__new__(module.ProwlarrExtend)
+            plugin._config_snapshot = {
+                "host": "https://prowlarr.invalid",
+                "api_key": "not-a-real-key",
+                "proxy": False,
+                "timeout": 12,
+            }
+            plugin.search_torrents(
+                {"id": 4, "name": "Alpha", "domain": "prowlarr_extend.7"},
+                keyword="Ｔｅｓｔ１２３， Ｓ！",
+            )
+
+            query = parse_qs(urlparse(calls[1][1]).query)
+            self.assertEqual(query["q"], ["Test123 S"])
+            self.assertEqual(
+                _StringUtils.clear_calls,
+                [("Test123, S!", " ", True)],
+            )
+
+            calls.clear()
+            title = "落第賢者の学院無双 ～二度目の転生、Ｓランクチート魔術師冒険録～"
+            expected = "落第賢者の学院無双 二度目の転生 Sランクチート魔術師冒険録"
+            plugin.search_torrents(
+                {"id": 4, "name": "Alpha", "domain": "prowlarr_extend.7"},
+                keyword=title,
+            )
+            query = parse_qs(urlparse(calls[1][1]).query)
+            self.assertEqual(query["q"], [expected])
+
+    def test_search_keeps_normalized_chinese_and_ascii_keyword_unchanged(self):
+        _StringUtils.clear_calls.clear()
+        with loaded_module() as module:
+            calls = []
+
+            class Request:
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                def get_res(self, url, **kwargs):
+                    calls.append(url)
+                    return _Response(
+                        headers={"Content-Type": "application/rss+xml"},
+                        text="<?xml version='1.0'?><rss><channel /></rss>",
+                    )
+
+            module.RequestUtils = Request
+            plugin = object.__new__(module.ProwlarrExtend)
+            plugin._config_snapshot = {
+                "host": "https://prowlarr.invalid",
+                "api_key": "not-a-real-key",
+                "proxy": False,
+                "timeout": 12,
+            }
+            keywords = ("落第賢者の学院無双 Sランク", "ASCII 123")
+            for keyword in keywords:
+                plugin.search_torrents(
+                    {"id": 4, "name": "Alpha", "domain": "prowlarr_extend.7"},
+                    keyword=keyword,
+                )
+
+            self.assertEqual(
+                [parse_qs(urlparse(url).query)["q"][0] for url in calls],
+                list(keywords),
+            )
 
     def test_yts_numeric_imdb_attr_reaches_moviepilot_identity_fast_path(self):
         with loaded_module() as module:

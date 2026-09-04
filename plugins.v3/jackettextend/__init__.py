@@ -5,6 +5,7 @@ import math
 import re
 import threading
 import time
+import unicodedata
 import xml.dom.minidom
 from typing import List, Dict, Any, Tuple, Optional
 from urllib.parse import urlencode, quote, quote_plus, urlsplit
@@ -860,6 +861,9 @@ class JackettExtend(_PluginBase):
 
         # D4: keyword 为空时使用 Jackett 空查询获取最新资源(refresh_torrents/RSS 刷新)
         keyword = keyword or ""
+        # Canonicalize width/compatibility characters before MoviePilot's
+        # punctuation cleaning to avoid upstream redirects (e.g. Ｓ -> S).
+        keyword = unicodedata.normalize("NFKC", keyword)
         keyword = StringUtils.clear(text=keyword, replace_word=" ", allow_space=True)
         masked_keyword = self.__mask_keyword(keyword)
         api_url = ""

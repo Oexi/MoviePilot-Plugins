@@ -19,6 +19,10 @@ class StringUtilsStub:
         StringUtilsStub.clear_calls.append((text, replace_word, allow_space))
         if text == "My Soul,Your Beats!/Brave Song":
             return "My Soul Your Beats Brave Song"
+        if text == "Test123, S!":
+            return "Test123 S"
+        if text == "落第賢者の学院無双 ~二度目の転生、Sランクチート魔術師冒険録~":
+            return "落第賢者の学院無双 二度目の転生 Sランクチート魔術師冒険録"
         return text
 
     @staticmethod
@@ -141,13 +145,36 @@ class JackettSearchKeywordTest(unittest.TestCase):
             self.assertEqual(query["q"], [""])
             self.assertEqual(captured["keyword"], "")
 
-    def test_already_normalized_keyword_is_unchanged(self):
+    def test_full_width_keyword_is_nfkc_normalized_before_cleaning_and_query(self):
         with loaded_plugin_module() as module:
-            captured = self.run_search(module, "My Soul Your Beats Brave Song")
+            captured = self.run_search(module, "Ｔｅｓｔ１２３， Ｓ！")
 
         query = parse_qs(urlparse(captured["url"]).query)
-        self.assertEqual(query["q"], ["My Soul Your Beats Brave Song"])
-        self.assertEqual(captured["keyword"], "My Soul Your Beats Brave Song")
+        self.assertEqual(query["q"], ["Test123 S"])
+        self.assertEqual(captured["keyword"], "Test123 S")
+        self.assertEqual(
+            StringUtilsStub.clear_calls,
+            [("Test123, S!", " ", True)],
+        )
+
+    def test_real_world_full_width_title_is_cleaned_for_torznab_query(self):
+        title = "落第賢者の学院無双 ～二度目の転生、Ｓランクチート魔術師冒険録～"
+        expected = "落第賢者の学院無双 二度目の転生 Sランクチート魔術師冒険録"
+        with loaded_plugin_module() as module:
+            captured = self.run_search(module, title)
+
+        query = parse_qs(urlparse(captured["url"]).query)
+        self.assertEqual(query["q"], [expected])
+        self.assertEqual(captured["keyword"], expected)
+
+    def test_already_normalized_keyword_is_unchanged(self):
+        for keyword in ("My Soul Your Beats Brave Song", "落第賢者の学院無双 Sランク"):
+            with self.subTest(keyword=keyword), loaded_plugin_module() as module:
+                captured = self.run_search(module, keyword)
+
+            query = parse_qs(urlparse(captured["url"]).query)
+            self.assertEqual(query["q"], [keyword])
+            self.assertEqual(captured["keyword"], keyword)
 
     def test_exact_profile_indexer_id_wins_over_decoded_domain(self):
         with loaded_plugin_module() as module:
