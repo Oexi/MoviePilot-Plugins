@@ -225,14 +225,14 @@ def site_oper_modules(site_oper, eventmanager, event_type):
 class ProwlarrV3ContractTest(unittest.TestCase):
     def test_metadata_module_and_async_search_contract(self):
         manifest = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["ProwlarrExtend"]["version"], "1.0.3")
+        self.assertEqual(manifest["ProwlarrExtend"]["version"], "1.0.4")
         self.assertEqual(manifest["ProwlarrExtend"]["icon"], "Prowlarr.png")
         self.assertEqual(manifest["ProwlarrExtend"]["author"], "Oexi")
-        self.assertEqual(manifest["JackettExtend"]["version"], "3.2.16")
+        self.assertEqual(manifest["JackettExtend"]["version"], "3.2.17")
         with loaded_module() as module:
             self.assertEqual(module.ProwlarrExtend.plugin_icon, "Prowlarr.png")
             self.assertEqual(module.ProwlarrExtend.plugin_author, "Oexi")
-            self.assertEqual(module.ProwlarrExtend.plugin_version, "1.0.3")
+            self.assertEqual(module.ProwlarrExtend.plugin_version, "1.0.4")
             self.assertEqual(module.ProwlarrExtend.plugin_config_prefix, "prowlarr_extend_")
 
             plugin = object.__new__(module.ProwlarrExtend)
