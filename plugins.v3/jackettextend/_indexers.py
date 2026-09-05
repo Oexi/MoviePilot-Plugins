@@ -33,6 +33,12 @@ _PRIVACY_ALIASES = {
     PRIVACY_UNKNOWN: PRIVACY_UNKNOWN,
 }
 
+_CATEGORY_RANGES = (
+    ("movie", 2000, 3000),
+    ("music", 3000, 4000),
+    ("tv", 5000, 6000),
+)
+
 
 def normalize_privacy(value: object) -> Optional[str]:
     """Normalize a Jackett privacy/type value to a known category.
@@ -205,16 +211,18 @@ def _category_for_caps(caps: object) -> dict:
         if not isinstance(cap, Mapping):
             continue
         cap_id = str(cap.get("ID", "")).strip()
-        if not cap_id:
+        if not re.fullmatch(r"[0-9]+", cap_id):
             continue
         cap_name = str(cap.get("Name") or "").strip() or cap_id
         entry = {"id": cap_id, "cat": cap_name, "desc": cap_name}
-        if cap_id.startswith("2000"):
-            category.setdefault("movie", []).append(entry)
-        elif cap_id.startswith("5000"):
-            category.setdefault("tv", []).append(entry)
-        elif cap_id.startswith("3000"):
-            category.setdefault("music", []).append(entry)
+        try:
+            numeric_id = int(cap_id)
+        except ValueError:
+            continue
+        for category_key, lower_bound, upper_bound in _CATEGORY_RANGES:
+            if lower_bound <= numeric_id < upper_bound:
+                category.setdefault(category_key, []).append(entry)
+                break
     return category
 
 

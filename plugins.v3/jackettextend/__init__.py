@@ -1,6 +1,7 @@
 # _*_ coding: utf-8 _*_
 import asyncio
 import copy
+import json
 import math
 import re
 import threading
@@ -35,6 +36,7 @@ from ._torznab import (
     select_torznab_enclosure,
     should_replace_torznab_duplicate,
 )
+from ._response import ResponseBodyTooLarge, ResponseReadTimeout, read_limited_response
 from . import _host_compat
 from ._indexers import (
     apply_indexer_selection,
@@ -55,7 +57,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.2.18"
+    plugin_version = "3.2.19"
     # 插件作者
     plugin_author = "oexi"
     # 作者主页
@@ -73,6 +75,8 @@ class JackettExtend(_PluginBase):
     SEARCH_TIMEOUT_DEFAULT = 30
     SEARCH_TIMEOUT_MIN = 5
     SEARCH_TIMEOUT_MAX = 120
+    REST_MAX_JSON_BYTES = 4 * 1024 * 1024
+    REST_MAX_ITEMS = 5000
     TORZNAB_MAX_XML_BYTES = 8 * 1024 * 1024
     TORZNAB_MAX_ITEMS = 5000
     # Existing rows are identified by the historical virtual-domain prefix;
@@ -126,6 +130,12 @@ class JackettExtend(_PluginBase):
         # would delete sites during an enabled -> enabled configuration reload.
         self._stop_runtime()
 
+        try:
+            self.sites_helper = SitesHelper()
+        except Exception as e:
+            logger.warning(f"【{self.plugin_name}】SitesHelper 初始化失败：{type(e).__name__}：{str(e)}")
+            self.sites_helper = None
+
         # All replacement of configuration/state is serialized with the
         # short commit phase.  A previous-generation worker may still be finishing a DB/event
         # operation after stop_service() returns; waiting here ensures the
@@ -163,48 +173,43 @@ class JackettExtend(_PluginBase):
                 generation = self._sync_generation
                 self._sync_stop_event = threading.Event()
 
-        try:
-            self.sites_helper = SitesHelper()
-        except Exception as e:
-            logger.warning(f"【{self.plugin_name}】SitesHelper 初始化失败：{type(e).__name__}：{str(e)}")
-            self.sites_helper = None
-
-        # 读取配置.  Keep assignment under the state lock so a concurrent
-        # search/form request cannot observe a partially applied replacement.
-        with self._state_lock:
-            if isinstance(config, dict) and config:
-                # A7: normalize the Jackett base URL before publishing it.
-                # Reject userinfo/query/fragment up front so credentials or
-                # stray query data can never bleed into later API URLs.
-                self._host = self._normalize_host(config.get("host"))
-                self._api_key = str(config.get("api_key") or "").strip()
-                self._password = str(config.get("password") or "")
-                self._enabled = bool(config.get("enabled"))
-                self._proxy = bool(config.get("proxy"))
-                self._timeout = self._normalize_timeout(
-                    config.get("timeout", config.get("search_timeout"))
-                )
-                raw_sites = config.get("indexer_sites") or ""
-                if isinstance(raw_sites, list):
-                    # UI 多选(VSelect multiple)保存为数组
-                    self._indexer_sites = [str(x).strip() for x in raw_sites if str(x).strip()]
-                else:
-                    # API/旧配置为逗号分隔字符串
-                    self._indexer_sites = [x.strip() for x in str(raw_sites).split(",") if x.strip()]
-                # Keep the distinction between an intentionally finite whitelist
-                # and an empty value (which means all indexers).  This flag stays
-                # true if cleanup removes only stale entries, preventing a
-                # transient all-stale list from becoming an implicit all-sites
-                # selection.
-                canonical_sites = self._parse_indexer_sites()
-                self._indexer_sites = canonical_sites
-                self._indexer_sites_explicit = bool(canonical_sites)
-                self._cron = str(config.get("cron") or "").strip() or "0 0 * * *"
-            # Immutable credentials/network settings are published in the
-            # same critical section as the fields above.  A worker keeps its
-            # local copy even if a reload replaces the instance attributes
-            # while its request is in flight.
-            self._config_snapshot = self._capture_config_snapshot_locked()
+            # 读取配置.  Keep assignment under the same state lock as
+            # generation replacement so a request cannot capture a partial
+            # replacement between reset and publication.
+            with self._state_lock:
+                if isinstance(config, dict) and config:
+                    # A7: normalize the Jackett base URL before publishing it.
+                    # Reject userinfo/query/fragment up front so credentials or
+                    # stray query data can never bleed into later API URLs.
+                    self._host = self._normalize_host(config.get("host"))
+                    self._api_key = str(config.get("api_key") or "").strip()
+                    self._password = str(config.get("password") or "")
+                    self._enabled = bool(config.get("enabled"))
+                    self._proxy = bool(config.get("proxy"))
+                    self._timeout = self._normalize_timeout(
+                        config.get("timeout", config.get("search_timeout"))
+                    )
+                    raw_sites = config.get("indexer_sites") or ""
+                    if isinstance(raw_sites, list):
+                        # UI 多选(VSelect multiple)保存为数组
+                        self._indexer_sites = [str(x).strip() for x in raw_sites if str(x).strip()]
+                    else:
+                        # API/旧配置为逗号分隔字符串
+                        self._indexer_sites = [x.strip() for x in str(raw_sites).split(",") if x.strip()]
+                    # Keep the distinction between an intentionally finite whitelist
+                    # and an empty value (which means all indexers).  This flag stays
+                    # true if cleanup removes only stale entries, preventing a
+                    # transient all-stale list from becoming an implicit all-sites
+                    # selection.
+                    canonical_sites = self._parse_indexer_sites()
+                    self._indexer_sites = canonical_sites
+                    self._indexer_sites_explicit = bool(canonical_sites)
+                    self._cron = str(config.get("cron") or "").strip() or "0 0 * * *"
+                # Immutable credentials/network settings are published in the
+                # same critical section as the fields above.  A worker keeps its
+                # local copy even if a reload replaces the instance attributes
+                # while its request is in flight.
+                self._config_snapshot = self._capture_config_snapshot_locked()
         if not self._enabled:
             # A direct disabled initialization must also converge persisted
             # sites when the host does not call stop_service() first.
@@ -306,6 +311,26 @@ class JackettExtend(_PluginBase):
                 return dict(snapshot)
             return self._capture_config_snapshot_locked()
 
+    def _capture_request_context(self):
+        """Capture the configuration and generation for one UI request."""
+        with self._sync_lock:
+            with self._state_lock:
+                snapshot = getattr(self, "_config_snapshot", None)
+                if not isinstance(snapshot, dict) or not snapshot:
+                    snapshot = self._capture_config_snapshot_locked()
+                generation = getattr(self, "_sync_generation", 0)
+                return dict(snapshot), generation
+
+    def _commit_indexers_cache(self, indexers: object, generation: int) -> bool:
+        """Commit only a useful, current indexer snapshot to the UI cache."""
+        with self._state_lock:
+            if not self._sync_is_current(generation):
+                return False
+            if isinstance(indexers, list) and indexers:
+                self._indexers_cache = copy.deepcopy(indexers)
+                self._indexers_cache_ts = time.time()
+            return True
+
     @classmethod
     def _domain_prefix_set(cls):
         """Return normalized virtual-domain prefixes used by persisted rows."""
@@ -330,11 +355,11 @@ class JackettExtend(_PluginBase):
         event = self._sync_stop_event
         with self._state_lock:
             current = self._sync_generation
-        if event is None and generation is None:
-            # Unit callers may exercise the pure cleanup policy without
-            # starting the plugin service; production workers always install
-            # an event during init.
-            return True
+        if event is None:
+            # Unit callers may exercise request/cache behavior without
+            # starting the plugin service; a generation still identifies the
+            # request when no runtime event has been installed.
+            return generation is None or generation == current
         return (
             event is not None
             and not event.is_set()
@@ -425,12 +450,21 @@ class JackettExtend(_PluginBase):
         检查连通性
         :return: True、False
         """
-        if generation is not None and not self._sync_is_current(generation):
+        if generation is None:
+            captured_snapshot, captured_generation = self._capture_request_context()
+            if config_snapshot is None:
+                config_snapshot = captured_snapshot
+            generation = captured_generation
+        if not self._sync_is_current(generation):
             return False
-        snapshot = dict(config_snapshot or self._config_for_sync())
+        snapshot = (
+            dict(config_snapshot)
+            if config_snapshot is not None
+            else self._config_for_sync()
+        )
         if not snapshot.get("api_key") or not snapshot.get("host"):
             with self._state_lock:
-                if generation is not None and not self._sync_is_current(generation):
+                if not self._sync_is_current(generation):
                     return False
                 self._indexers = []
                 self._authoritative_indexers = None
@@ -452,13 +486,13 @@ class JackettExtend(_PluginBase):
             self._record_error("status_error", generation=generation)
             logger.error(f"【{self.plugin_name}】检查 Jackett 连通性失败：{type(e).__name__}")
             indexers = None
-        if generation is not None and not self._sync_is_current(generation):
+        if not self._sync_is_current(generation):
             return False
         # A1: distinguish failed(None), successful-empty([]), and fresh
         # non-empty snapshots.  Only the latter can authorize cleanup.
         selected = self._apply_indexer_selection(indexers)
         with self._state_lock:
-            if generation is not None and not self._sync_is_current(generation):
+            if not self._sync_is_current(generation):
                 return False
             # Commit deep copies so callers cannot mutate the authoritative
             # snapshot/cache while a synchronization stage is using it.
@@ -480,7 +514,9 @@ class JackettExtend(_PluginBase):
         完整同步：拉取索引器列表 → 清理失效勾选 → 注册/注入 → 清理过期站点。
         定时任务与初始化共用，确保 Jackett 变更(新增/移除/白名单)自动同步到 MP。
         """
-        if generation is not None and not self._sync_is_current(generation):
+        if generation is None:
+            _, generation = self._capture_request_context()
+        if not self._sync_is_current(generation):
             return
         # Capture immutable credentials before any network call.  The commit
         # lock is intentionally not held during get_status()/HTTP requests.
@@ -610,12 +646,15 @@ class JackettExtend(_PluginBase):
         self._sync_thread = None
 
     def stop_service(self):
-        """Stop runtime resources and remove this plugin's persisted sites."""
+        """Stop runtime resources while preserving persisted site rows."""
         self._stop_runtime()
+        # Drain only the short DB/event commit phase.  Network fetches happen
+        # before workers acquire this lock, so the bounded join above remains
+        # the only wait on an in-flight network request.
         with self._sync_lock:
             with self._state_lock:
                 self._enabled = False
-            return self.__remove_managed_sites()
+        return True
 
     def __remove_managed_sites(self):
         """Remove only persisted sites in JackettExtend's reserved namespace."""
@@ -984,45 +1023,65 @@ class JackettExtend(_PluginBase):
         :param force_refresh: True 强制实时拉取(初始化/cron),False 优先使用 TTL 缓存
         :return: Indexer 列表；拉取成功但为空返回 []，拉取失败返回 None
         """
+        current_snapshot, current_generation = self._capture_request_context()
+        request_snapshot = (
+            dict(config_snapshot)
+            if config_snapshot is not None
+            else current_snapshot
+        )
+        request_generation = (
+            generation
+            if generation is not None
+            else current_generation
+        )
+        if not self._sync_is_current(request_generation):
+            return None
+
         now = time.time()
         with self._state_lock:
-            cached = self._indexers_cache
+            cached = copy.deepcopy(self._indexers_cache)
             cached_ts = self._indexers_cache_ts
 
         if force_refresh:
             # 初始化/cron 同步强制刷新;失败返回 None,不复用旧缓存,
             # 避免把旧数据误判为"本次拉取成功"而触发破坏性清理(A1)
-            raw = self.__fetch_indexers(config_snapshot=config_snapshot, generation=generation)
-            if raw is None:
+            raw = self.__fetch_indexers(
+                config_snapshot=request_snapshot,
+                generation=request_generation,
+            )
+            if raw is None or not self._sync_is_current(request_generation):
                 return None
-            if generation is None or self._sync_is_current(generation):
-                with self._state_lock:
-                    if generation is None or self._sync_is_current(generation):
-                        self._indexers_cache = copy.deepcopy(raw)
-                        self._indexers_cache_ts = time.time()
+            if not self._commit_indexers_cache(raw, request_generation):
+                return None
         elif isinstance(cached, list) and cached_ts and (now - cached_ts) < self._indexers_ttl:
             # E1: TTL 内直接使用缓存
             raw = cached
         else:
             # E1/G4: 表单/详情页缓存过期或缺失时尝试刷新;失败用旧缓存兜底,
             # 并顺延时间戳,避免 Jackett 故障时每次打开页面都阻塞在超时请求上
-            raw = self.__fetch_indexers(config_snapshot=config_snapshot, generation=generation)
+            raw = self.__fetch_indexers(
+                config_snapshot=request_snapshot,
+                generation=request_generation,
+            )
             if raw is not None:
-                if generation is None or self._sync_is_current(generation):
-                    with self._state_lock:
-                        if generation is None or self._sync_is_current(generation):
-                            self._indexers_cache = copy.deepcopy(raw)
-                            self._indexers_cache_ts = time.time()
+                if not self._commit_indexers_cache(raw, request_generation):
+                    return None
             elif isinstance(cached, list):
-                raw = cached
                 with self._state_lock:
+                    if not self._sync_is_current(request_generation):
+                        return None
                     self._indexers_cache_ts = time.time()
+                    raw = copy.deepcopy(self._indexers_cache)
             else:
                 return None
 
+        if not self._sync_is_current(request_generation):
+            return None
         if not filter_selected:
-            return copy.deepcopy(raw)
-        return self._apply_indexer_selection(raw)
+            result = copy.deepcopy(raw)
+        else:
+            result = self._apply_indexer_selection(raw)
+        return result if self._sync_is_current(request_generation) else None
 
     def __fetch_indexers(self, config_snapshot: Optional[dict] = None,
                          generation: Optional[int] = None,
@@ -1038,7 +1097,11 @@ class JackettExtend(_PluginBase):
             else:
                 self._record_error(category, generation=generation)
 
-        snapshot = dict(config_snapshot or self._config_for_sync())
+        snapshot = (
+            dict(config_snapshot)
+            if config_snapshot is not None
+            else self._config_for_sync()
+        )
         host = self._normalize_host(snapshot.get("host"))
         api_key = str(snapshot.get("api_key") or "")
         password = str(snapshot.get("password") or "")
@@ -1060,54 +1123,75 @@ class JackettExtend(_PluginBase):
             # E2: 密码为空时跳过登录;仅通过 data 提交密码,不放入 URL query string
             if password:
                 login_url = f"{host}/UI/Dashboard"
+                login_res = None
                 try:
                     login_res = RequestUtils(headers=headers, session=session, timeout=timeout).post_res(
                         url=login_url,
                         data={"password": password},
-                        proxies=settings.PROXY if proxy else None
+                        proxies=settings.PROXY if proxy else None,
+                        stream=True,
                     )
                 except Exception as e:
                     record_fetch_error("login_error")
                     logger.warning(f"【{self.plugin_name}】Jackett 登录请求异常：{type(e).__name__}")
-                    login_res = None
+                finally:
+                    if login_res is not None:
+                        try:
+                            login_res.close()
+                        except Exception:
+                            pass
                 if login_res is not None and session.cookies:
                     cookie = session.cookies.get_dict()
                 elif password:
                     logger.warning(f"【{self.plugin_name}】Jackett 登录失败，无法获取 cookie")
 
             indexer_query_url = f"{host}/api/v2.0/indexers?configured=true"
-            ret = RequestUtils(headers=headers, cookies=cookie, timeout=timeout).get_res(
+            with RequestUtils(headers=headers, cookies=cookie, timeout=timeout).get_stream(
                 indexer_query_url,
                 proxies=settings.PROXY if proxy else None,
                 raise_exception=True,
-            )
-
-            # E3: 校验状态码/Content-Type/数据类型,json 只解析一次
-            if ret is None:
-                record_fetch_error("empty")
-                logger.warning(f"【{self.plugin_name}】拉取 indexers 请求失败：{redact_url(indexer_query_url)}")
-                return None
-            if ret.status_code != 200:
-                record_fetch_error(f"http_{ret.status_code}")
-                logger.warning(f"【{self.plugin_name}】拉取 indexers 失败,HTTP {ret.status_code}：{redact_url(indexer_query_url)}")
-                return None
-            content_type = (ret.headers.get("Content-Type") or "").lower()
-            if "json" not in content_type:
-                record_fetch_error("content_type")
-                logger.warning(f"【{self.plugin_name}】拉取 indexers 响应非 JSON(Content-Type={content_type!r})")
-                return None
-            try:
-                raw_indexers = ret.json()
-            except ValueError as e:
-                record_fetch_error("json_error")
-                logger.warning(f"【{self.plugin_name}】拉取 indexers JSON 解析失败：{type(e).__name__}")
-                return None
-            if not isinstance(raw_indexers, list):
-                record_fetch_error("json_type")
-                logger.warning(
-                    f"【{self.plugin_name}】拉取 indexers 响应类型异常"
-                    f"(期望 list,实际 {type(raw_indexers).__name__})")
-                return None
+            ) as ret:
+                # E3: 校验状态码/Content-Type/数据类型,json 只解析一次
+                if ret is None:
+                    record_fetch_error("empty")
+                    logger.warning(f"【{self.plugin_name}】拉取 indexers 请求失败：{redact_url(indexer_query_url)}")
+                    return None
+                status_code = getattr(ret, "status_code", 0)
+                if status_code != 200:
+                    record_fetch_error(f"http_{status_code}")
+                    logger.warning(f"【{self.plugin_name}】拉取 indexers 失败,HTTP {status_code}：{redact_url(indexer_query_url)}")
+                    return None
+                response_headers = getattr(ret, "headers", {}) or {}
+                content_type = (response_headers.get("Content-Type") or "").lower()
+                if "json" not in content_type:
+                    record_fetch_error("content_type")
+                    logger.warning(f"【{self.plugin_name}】拉取 indexers 响应非 JSON(Content-Type={content_type!r})")
+                    return None
+                body = read_limited_response(ret, self.REST_MAX_JSON_BYTES)
+                try:
+                    raw_indexers = json.loads(body)
+                except ValueError as e:
+                    record_fetch_error("json_error")
+                    logger.warning(f"【{self.plugin_name}】拉取 indexers JSON 解析失败：{type(e).__name__}")
+                    return None
+                if not isinstance(raw_indexers, list):
+                    record_fetch_error("json_type")
+                    logger.warning(
+                        f"【{self.plugin_name}】拉取 indexers 响应类型异常"
+                        f"(期望 list,实际 {type(raw_indexers).__name__})")
+                    return None
+                if len(raw_indexers) > self.REST_MAX_ITEMS:
+                    record_fetch_error("json_too_many_items")
+                    logger.warning(f"【{self.plugin_name}】Jackett indexer 数量超出限制")
+                    return None
+        except ResponseReadTimeout:
+            record_fetch_error("timeout")
+            logger.warning(f"【{self.plugin_name}】获取 Jackett indexers 超时")
+            return None
+        except ResponseBodyTooLarge:
+            record_fetch_error("json_too_large")
+            logger.warning(f"【{self.plugin_name}】Jackett indexer JSON 超出大小限制")
+            return None
         except (requests.Timeout, TimeoutError):
             record_fetch_error("timeout")
             logger.warning(f"【{self.plugin_name}】获取 Jackett indexers 超时")
@@ -1291,52 +1375,49 @@ class JackettExtend(_PluginBase):
         )
         request_proxy = bool(request_config.get("proxy", getattr(self, "_proxy", False)))
         try:
-            ret = RequestUtils(timeout=request_timeout).get_res(
+            with RequestUtils(timeout=request_timeout).get_stream(
                 url,
                 proxies=settings.PROXY if request_proxy else None,
                 raise_exception=True,
-            )
+            ) as ret:
+                if ret is None:
+                    self._record_error("empty", source="search")
+                    logger.debug(f"【{self.plugin_name}】torznab 空响应：url={log_url}")
+                    return []
+
+                status_code = getattr(ret, "status_code", 0)
+                response_headers = getattr(ret, "headers", {}) or {}
+                content_type = (response_headers.get("Content-Type") or "").lower()
+                if status_code != 200:
+                    self._record_error(f"http_{status_code}", source="search")
+                    logger.warning(
+                        f"【{self.plugin_name}】Jackett torznab 响应不可用："
+                        f"url={log_url}, category=http_error, HTTP={status_code}, "
+                        f"content_type={content_type or '-'}"
+                    )
+                    return []
+                body = read_limited_response(ret, self.TORZNAB_MAX_XML_BYTES)
+        except ResponseReadTimeout:
+            self._record_error("timeout", source="search")
+            logger.warning(f"【{self.plugin_name}】torznab 响应超时：url={log_url}")
+            return []
         except (requests.Timeout, TimeoutError):
             self._record_error("timeout", source="search")
             logger.warning(f"【{self.plugin_name}】torznab 响应超时：url={log_url}")
+            return []
+        except ResponseBodyTooLarge:
+            self._record_error("xml_too_large", source="search")
+            logger.warning(f"【{self.plugin_name}】torznab XML 超出大小限制：url={log_url}")
             return []
         except Exception as e:
             # requests 异常文本可能回显带 apikey 的原始 URL，仅记录异常类型。
             self._record_error("request_error", source="search")
             logger.error(f"【{self.plugin_name}】torznab 请求异常：url={log_url}, 类型={type(e).__name__}")
             return []
-        if ret is None:
-            self._record_error("empty", source="search")
-            logger.debug(f"【{self.plugin_name}】torznab 空响应：url={log_url}")
-            return []
-
         # F1: 校验状态码与 Content-Type;JSON 错误体不进 XML 解析
-        response_headers = getattr(ret, "headers", {}) or {}
-        content_type = (response_headers.get("Content-Type") or "").lower()
-        # ``requests.Response.content`` is the original wire representation;
-        # keep it as bytes so an XML declaration controls decoding.  Some
-        # lightweight response doubles omit ``content`` or expose a different
-        # type, so those cases retain the historical ``text`` fallback.
-        raw_content = getattr(ret, "content", None)
-        if isinstance(raw_content, (bytes, bytearray, memoryview)):
-            body = bytes(raw_content)
-        else:
-            body = getattr(ret, "text", "")
-        status_code = getattr(ret, "status_code", 0)
-        if isinstance(body, bytes):
-            body_empty = not body or body.isspace()
-            # The Jackett helper predates raw-byte response support and only
-            # needs a non-empty string for its status/content-type checks.
-            # Do not decode the XML merely to classify it.
-            classification_body = "" if body_empty else "raw-bytes"
-        elif isinstance(body, str):
-            body_empty = not body.strip()
-            classification_body = body
-        else:
-            body_empty = True
-            classification_body = ""
+        body_empty = not body.strip()
         response_category = classify_torznab_response(
-            status_code, content_type, classification_body
+            200, content_type, body
         )
         if response_category != "ok":
             if response_category == "http_error":
@@ -1356,17 +1437,7 @@ class JackettExtend(_PluginBase):
             return []
         # Keep minidom bounded and reject DTD/entity declarations before the
         # parser sees them.  Normal Torznab RSS is small and has no DOCTYPE;
-        # oversized/adversarial payloads are treated as an invalid response.
-        if isinstance(body, bytes):
-            body_size = len(body)
-        elif isinstance(body, str):
-            body_size = len(body.encode("utf-8", errors="ignore"))
-        else:
-            body_size = 0
-        if body_size > self.TORZNAB_MAX_XML_BYTES:
-            self._record_error("xml_too_large", source="search")
-            logger.warning(f"【{self.plugin_name}】torznab XML 超出大小限制：url={log_url}")
-            return []
+        # oversized/adversarial payloads are rejected by the streaming reader.
         try:
             contains_dtd = contains_xml_dtd(body)
         except (LookupError, UnicodeError) as e:
@@ -1515,11 +1586,19 @@ class JackettExtend(_PluginBase):
         """
         拼装插件配置页面，需要返回两块数据：1、页面配置；2、数据结构
         """
+        config_snapshot, generation = self._capture_request_context()
         # 动态生成索引器多选选项(完整列表,不受白名单过滤影响,否则无法取消勾选)
         # E1/G4: 优先使用 TTL 缓存,避免每次打开表单都请求 Jackett
         site_options = []
         try:
-            for idx in self.get_indexers(filter_selected=False) or []:
+            indexers = self.get_indexers(
+                filter_selected=False,
+                config_snapshot=config_snapshot,
+                generation=generation,
+            )
+            if not self._sync_is_current(generation):
+                indexers = None
+            for idx in indexers or []:
                 site_options.append({"title": f"{idx.get('name', '')} ({idx.get('indexer_id', '')})",
                                      # C2: 以 indexer_id 为单一事实来源,合成名仅用于显示
                                      "value": idx.get('indexer_id')})
@@ -1532,32 +1611,64 @@ class JackettExtend(_PluginBase):
             timeout_max=self.SEARCH_TIMEOUT_MAX,
         )
 
-    def _ensure_sites_loaded(self) -> bool:
+    def _ensure_sites_loaded(self, config_snapshot: Optional[dict] = None,
+                             generation: Optional[int] = None) -> bool:
         """
         确保 self._indexers 已加载数据，若为空则尝试重新加载。
         :return: 成功加载返回 True，否则 False
         """
+        current_snapshot, current_generation = self._capture_request_context()
+        request_snapshot = (
+            dict(config_snapshot)
+            if config_snapshot is not None
+            else current_snapshot
+        )
+        request_generation = (
+            generation
+            if generation is not None
+            else current_generation
+        )
+        if not self._sync_is_current(request_generation):
+            return False
+
         with self._state_lock:
             current = self._indexers
         if isinstance(current, list) and len(current) > 0:
-            return True
+            return self._sync_is_current(request_generation)
 
         # E1/G4: 详情页优先使用 TTL 缓存,不强制实时请求
-        indexers = self.get_indexers(filter_selected=True)
-        if indexers is None:
+        indexers = self.get_indexers(
+            filter_selected=True,
+            config_snapshot=request_snapshot,
+            generation=request_generation,
+        )
+        if indexers is None or not indexers:
             return False
         with self._state_lock:
-            self._indexers = indexers
+            if not self._sync_is_current(request_generation):
+                return False
+            self._indexers = copy.deepcopy(indexers)
             self._fetch_ok = True
-        return len(indexers) > 0
+        return self._sync_is_current(request_generation)
 
     def get_page(self) -> List[dict]:
         """
             拼装插件详情页面，需要返回页面配置，同时附带数据
         """
-        if not self._ensure_sites_loaded():
+        config_snapshot, generation = self._capture_request_context()
+        if not self._ensure_sites_loaded(
+                config_snapshot=config_snapshot,
+                generation=generation):
             return []
 
         with self._state_lock:
-            indexers = list(self._indexers) if isinstance(self._indexers, list) else []
+            if not self._sync_is_current(generation):
+                return []
+            indexers = (
+                copy.deepcopy(self._indexers)
+                if isinstance(self._indexers, list)
+                else []
+            )
+        if not self._sync_is_current(generation):
+            return []
         return build_page(indexers)

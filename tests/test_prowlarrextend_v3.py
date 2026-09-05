@@ -10,6 +10,7 @@ import codecs
 import importlib.util
 import json
 import sys
+import threading
 import types
 import unittest
 import xml.dom.minidom
@@ -19,6 +20,7 @@ from urllib.parse import parse_qs, urlparse
 from xml.parsers.expat import ExpatError
 
 import requests
+from urllib3.exceptions import ReadTimeoutError
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -81,8 +83,15 @@ class _Response:
         self.status_code = status_code
         self.headers = headers or {"Content-Type": "application/json"}
         self.text = text
-        self.content = text.encode("utf-8")
+        self._wire_content = text.encode("utf-8")
         self._payload = payload
+        self.closed = False
+
+    def iter_content(self, chunk_size=1):
+        yield self._wire_content
+
+    def close(self):
+        self.closed = True
 
     def json(self):
         if isinstance(self._payload, BaseException):
@@ -90,6 +99,45 @@ class _Response:
         if self._payload is not None:
             return self._payload
         return json.loads(self.text)
+
+
+class _GuardedResponse:
+    """Streaming double that fails if production reads buffered properties."""
+
+    def __init__(self, chunks, status_code=200, headers=None, error=None):
+        self.status_code = status_code
+        self.headers = headers or {"Content-Type": "application/xml"}
+        self._chunks = tuple(chunks)
+        self._error = error
+        self.iterated_chunks = 0
+        self.closed = False
+
+    @property
+    def content(self):
+        raise AssertionError("streaming code must not read response.content")
+
+    @property
+    def text(self):
+        raise AssertionError("streaming code must not read response.text")
+
+    def iter_content(self, chunk_size=1):
+        for chunk in self._chunks:
+            self.iterated_chunks += 1
+            yield chunk
+        if self._error is not None:
+            raise self._error
+
+    def close(self):
+        self.closed = True
+
+
+@contextmanager
+def _stream_response(response):
+    try:
+        yield response
+    finally:
+        if response is not None:
+            response.close()
 
 
 def _real_xml_response(content):
@@ -100,6 +148,20 @@ def _real_xml_response(content):
     response._content = content
     response._content_consumed = True
     return response
+
+
+def _real_stream_response(stream_factory, headers):
+    """Build a real response whose raw stream is controlled by a test."""
+    close_calls = []
+    response = requests.Response()
+    response.status_code = 200
+    response.headers = headers
+    response.raw = types.SimpleNamespace(
+        stream=lambda *_args, **_kwargs: stream_factory(),
+        close=lambda: close_calls.append(True),
+    )
+    response._content_consumed = False
+    return response, close_calls
 
 
 @contextmanager
@@ -246,14 +308,15 @@ class ProwlarrV3ContractTest(unittest.TestCase):
 
     def test_metadata_module_and_async_search_contract(self):
         manifest = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["ProwlarrExtend"]["version"], "1.0.5")
-        self.assertEqual(manifest["ProwlarrExtend"]["icon"], "Prowlarr.png")
-        self.assertEqual(manifest["ProwlarrExtend"]["author"], "oexi")
-        self.assertEqual(manifest["JackettExtend"]["version"], "3.2.18")
+        with loaded_module() as module:
+            self.assertEqual(manifest["ProwlarrExtend"]["version"], module.ProwlarrExtend.plugin_version)
+            self.assertEqual(manifest["ProwlarrExtend"]["icon"], "Prowlarr.png")
+            self.assertEqual(manifest["ProwlarrExtend"]["author"], "oexi")
+            self.assertEqual(manifest["JackettExtend"]["version"], "3.2.19")
         with loaded_module() as module:
             self.assertEqual(module.ProwlarrExtend.plugin_icon, "Prowlarr.png")
             self.assertEqual(module.ProwlarrExtend.plugin_author, "oexi")
-            self.assertEqual(module.ProwlarrExtend.plugin_version, "1.0.5")
+            self.assertEqual(module.ProwlarrExtend.plugin_version, manifest["ProwlarrExtend"]["version"])
             self.assertEqual(module.ProwlarrExtend.plugin_config_prefix, "prowlarr_extend_")
 
             plugin = object.__new__(module.ProwlarrExtend)
@@ -310,6 +373,9 @@ class ProwlarrV3ContractTest(unittest.TestCase):
                     calls.append(("get", url, kwargs))
                     return response
 
+                def get_stream(self, *args, **kwargs):
+                    return _stream_response(self.get_res(*args, **kwargs))
+
             module.RequestUtils = Request
             plugin = object.__new__(module.ProwlarrExtend)
             result = plugin._ProwlarrExtend__fetch_indexers({
@@ -339,6 +405,9 @@ class ProwlarrV3ContractTest(unittest.TestCase):
 
                 def get_res(self, *args, **kwargs):
                     return self.response
+
+                def get_stream(self, *args, **kwargs):
+                    return _stream_response(self.get_res(*args, **kwargs))
 
             module.RequestUtils = Request
             cases = [
@@ -403,6 +472,9 @@ class ProwlarrV3ContractTest(unittest.TestCase):
                     calls.append(("get", url, kwargs))
                     return response
 
+                def get_stream(self, *args, **kwargs):
+                    return _stream_response(self.get_res(*args, **kwargs))
+
             module.RequestUtils = Request
             plugin = object.__new__(module.ProwlarrExtend)
             plugin._config_snapshot = {
@@ -451,6 +523,9 @@ class ProwlarrV3ContractTest(unittest.TestCase):
                         text="<?xml version='1.0'?><rss><channel /></rss>",
                     )
 
+                def get_stream(self, *args, **kwargs):
+                    return _stream_response(self.get_res(*args, **kwargs))
+
             module.RequestUtils = Request
             plugin = object.__new__(module.ProwlarrExtend)
             plugin._config_snapshot = {
@@ -497,6 +572,9 @@ class ProwlarrV3ContractTest(unittest.TestCase):
                         text="<?xml version='1.0'?><rss><channel /></rss>",
                     )
 
+                def get_stream(self, *args, **kwargs):
+                    return _stream_response(self.get_res(*args, **kwargs))
+
             module.RequestUtils = Request
             plugin = object.__new__(module.ProwlarrExtend)
             plugin._config_snapshot = {
@@ -533,6 +611,9 @@ class ProwlarrV3ContractTest(unittest.TestCase):
 
                 def get_res(self, *_args, **_kwargs):
                     return response
+
+                def get_stream(self, *args, **kwargs):
+                    return _stream_response(self.get_res(*args, **kwargs))
 
             module.RequestUtils = Request
             plugin = object.__new__(module.ProwlarrExtend)
@@ -583,6 +664,9 @@ class ProwlarrV3ContractTest(unittest.TestCase):
                         text="<?xml version='1.0'?><rss><channel /></rss>",
                     )
 
+                def get_stream(self, *args, **kwargs):
+                    return _stream_response(self.get_res(*args, **kwargs))
+
             module.RequestUtils = Request
             plugin = object.__new__(module.ProwlarrExtend)
             plugin._config_snapshot = {
@@ -620,6 +704,9 @@ class ProwlarrV3ContractTest(unittest.TestCase):
                 def get_res(self, *_args, **_kwargs):
                     return response
 
+                def get_stream(self, *args, **kwargs):
+                    return _stream_response(self.get_res(*args, **kwargs))
+
             module.RequestUtils = Request
             plugin = object.__new__(module.ProwlarrExtend)
             plugin._config_snapshot = {
@@ -643,6 +730,252 @@ class ProwlarrV3ContractTest(unittest.TestCase):
             with self.assertRaises(module._host_compat.SanitizedUpstreamError):
                 asyncio.run(plugin.async_refresh_torrents(site=site, keyword=None))
 
+    def test_streaming_rest_and_xml_reads_never_touch_buffered_body(self):
+        with loaded_module() as module:
+            xml = (
+                '<?xml version="1.0" encoding="UTF-16"?><rss><channel>'
+                "<item><title>流式标题</title>"
+                "<enclosure url='https://site/stream.torrent'/></item>"
+                "</channel></rss>"
+            ).encode("utf-16")
+            xml_response = _GuardedResponse(
+                (xml[:5], xml[5:]),
+                headers={"Content-Type": "application/rss+xml"},
+            )
+            xml_calls = []
+
+            class XmlRequest:
+                def __init__(self, *args, **kwargs):
+                    xml_calls.append(kwargs)
+
+                def get_stream(self, *args, **kwargs):
+                    xml_calls.append(kwargs)
+                    return _stream_response(xml_response)
+
+            module.RequestUtils = XmlRequest
+            plugin = object.__new__(module.ProwlarrExtend)
+            plugin._config_snapshot = {
+                "host": "https://prowlarr.invalid",
+                "api_key": "not-a-real-key",
+                "proxy": True,
+                "timeout": 12,
+            }
+            results = plugin._ProwlarrExtend__parse_torznab_xml(
+                "https://prowlarr.invalid/results",
+                site={"name": "流式站点"},
+                keyword="title",
+            )
+
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0].title, "流式标题")
+            self.assertTrue(xml_response.closed)
+            self.assertEqual(xml_response.iterated_chunks, 2)
+            self.assertEqual(xml_calls[0]["headers"]["X-Api-Key"], "not-a-real-key")
+            self.assertTrue(xml_calls[1]["raise_exception"])
+
+            payload = json.dumps([{
+                "id": 7,
+                "name": "Torrent Alpha",
+                "enable": True,
+                "protocol": "torrent",
+                "supportsSearch": True,
+                "privacy": "public",
+                "capabilities": {"categories": []},
+            }]).encode("utf-8")
+            rest_response = _GuardedResponse(
+                (payload[:3], payload[3:]),
+                headers={"Content-Type": "application/json"},
+            )
+            rest_calls = []
+
+            class RestRequest:
+                def __init__(self, *args, **kwargs):
+                    rest_calls.append(kwargs)
+
+                def get_stream(self, *args, **kwargs):
+                    rest_calls.append(kwargs)
+                    return _stream_response(rest_response)
+
+            module.RequestUtils = RestRequest
+            fetched = plugin._ProwlarrExtend__fetch_indexers({
+                "host": "https://prowlarr.invalid",
+                "api_key": "not-a-real-key",
+                "proxy": False,
+                "timeout": 12,
+            })
+
+            self.assertEqual([item["indexer_id"] for item in fetched], ["7"])
+            self.assertTrue(rest_response.closed)
+            self.assertEqual(rest_response.iterated_chunks, 2)
+
+    def test_streaming_limits_and_read_errors_close_responses(self):
+        with loaded_module() as module:
+            plugin = object.__new__(module.ProwlarrExtend)
+            plugin._config_snapshot = {
+                "host": "https://prowlarr.invalid",
+                "api_key": "not-a-real-key",
+                "proxy": False,
+                "timeout": 9,
+            }
+            plugin._state_lock = module.ProwlarrExtend._state_lock
+            plugin.TORZNAB_MAX_XML_BYTES = 8
+            xml_url = "https://prowlarr.invalid/results?q=title"
+
+            class Request:
+                response = None
+
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                def get_stream(self, *args, **kwargs):
+                    return _stream_response(self.response)
+
+            module.RequestUtils = Request
+
+            oversized_xml = _GuardedResponse(
+                (b"x" * (plugin.TORZNAB_MAX_XML_BYTES + 1), b"tail"),
+                headers={"Content-Type": "application/xml"},
+            )
+            Request.response = oversized_xml
+            plugin._last_search_error = None
+            self.assertEqual(plugin._ProwlarrExtend__parse_torznab_xml(xml_url), [])
+            self.assertEqual(plugin._last_search_error, "xml_too_large")
+            self.assertTrue(oversized_xml.closed)
+            self.assertEqual(oversized_xml.iterated_chunks, 1)
+
+            rejected_xml = _GuardedResponse(
+                (),
+                status_code=401,
+                headers={"Content-Type": "application/xml"},
+                error=AssertionError("status rejection must not read the body"),
+            )
+            Request.response = rejected_xml
+            plugin._last_search_error = None
+            self.assertEqual(plugin._ProwlarrExtend__parse_torznab_xml(xml_url), [])
+            self.assertEqual(plugin._last_search_error, "http_401")
+            self.assertTrue(rejected_xml.closed)
+            self.assertEqual(rejected_xml.iterated_chunks, 0)
+
+            truncated_xml = _GuardedResponse(
+                (b"<rss>",),
+                headers={"Content-Type": "application/xml"},
+                error=requests.exceptions.ChunkedEncodingError("truncated"),
+            )
+            Request.response = truncated_xml
+            plugin._last_search_error = None
+            self.assertEqual(plugin._ProwlarrExtend__parse_torznab_xml(xml_url), [])
+            self.assertEqual(plugin._last_search_error, "request_error")
+            self.assertTrue(truncated_xml.closed)
+
+            plugin.REST_MAX_JSON_BYTES = 4
+            oversized_json = _GuardedResponse(
+                (b"1234", b"5", b"tail"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Content-Encoding": "gzip",
+                },
+            )
+            Request.response = oversized_json
+            plugin._last_error = None
+            self.assertIsNone(plugin._ProwlarrExtend__fetch_indexers({
+                "host": "https://prowlarr.invalid",
+                "api_key": "not-a-real-key",
+                "proxy": False,
+                "timeout": 9,
+            }))
+            self.assertEqual(plugin._last_error, "json_too_large")
+            self.assertTrue(oversized_json.closed)
+            self.assertEqual(oversized_json.iterated_chunks, 2)
+
+    def test_real_response_read_timeout_is_distinct_and_refresh_stays_sanitized(self):
+        with loaded_module() as module:
+            plugin = object.__new__(module.ProwlarrExtend)
+            plugin._config_snapshot = {
+                "host": "https://prowlarr.invalid",
+                "api_key": "not-a-real-key",
+                "proxy": False,
+                "timeout": 9,
+            }
+            plugin._state_lock = module.ProwlarrExtend._state_lock
+            site = {"id": 4, "name": "Sample Prowlarr", "domain": "prowlarr_extend.7"}
+
+            def timeout_xml_stream():
+                yield b"<rss>"
+                raise ReadTimeoutError(None, "/test", "timed out")
+
+            xml_response, xml_close_calls = _real_stream_response(
+                timeout_xml_stream,
+                {"Content-Type": "application/xml"},
+            )
+
+            class Request:
+                response = xml_response
+
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                def get_stream(self, *args, **kwargs):
+                    return _stream_response(self.response)
+
+            module.RequestUtils = Request
+            with self.assertRaises(module._host_compat.SanitizedUpstreamError) as raised:
+                plugin.refresh_torrents(site=site, keyword=None)
+            self.assertEqual(raised.exception.category, "timeout")
+            self.assertEqual(plugin._last_search_error, "timeout")
+            self.assertEqual(xml_close_calls, [True])
+
+            def timeout_json_stream():
+                yield b"["
+                raise ReadTimeoutError(None, "/test", "timed out")
+
+            json_response, json_close_calls = _real_stream_response(
+                timeout_json_stream,
+                {"Content-Type": "application/json"},
+            )
+            Request.response = json_response
+            plugin._last_error = None
+            self.assertIsNone(plugin._ProwlarrExtend__fetch_indexers({
+                "host": "https://prowlarr.invalid",
+                "api_key": "not-a-real-key",
+                "proxy": False,
+                "timeout": 9,
+            }))
+            self.assertEqual(plugin._last_error, "timeout")
+            self.assertEqual(json_close_calls, [True])
+
+            def connection_stream():
+                yield b"<rss>"
+                raise requests.ConnectionError("ordinary connection failure")
+
+            connection_response, connection_close_calls = _real_stream_response(
+                connection_stream,
+                {"Content-Type": "application/xml"},
+            )
+            Request.response = connection_response
+            plugin._last_search_error = None
+            self.assertEqual(plugin.search_torrents(site=site, keyword="title"), [])
+            self.assertEqual(plugin._last_search_error, "request_error")
+            self.assertEqual(connection_close_calls, [True])
+
+            def chunk_stream():
+                yield b"["
+                raise requests.exceptions.ChunkedEncodingError("truncated")
+
+            chunk_response, chunk_close_calls = _real_stream_response(
+                chunk_stream,
+                {"Content-Type": "application/json"},
+            )
+            Request.response = chunk_response
+            plugin._last_error = None
+            self.assertIsNone(plugin._ProwlarrExtend__fetch_indexers({
+                "host": "https://prowlarr.invalid",
+                "api_key": "not-a-real-key",
+                "proxy": False,
+                "timeout": 9,
+            }))
+            self.assertEqual(plugin._last_error, "request_error")
+            self.assertEqual(chunk_close_calls, [True])
+
     def test_torznab_http_json_xml_timeout_empty_and_limits_fail_closed(self):
         with loaded_module() as module:
             plugin = object.__new__(module.ProwlarrExtend)
@@ -662,6 +995,9 @@ class ProwlarrV3ContractTest(unittest.TestCase):
 
                 def get_res(self, *_args, **_kwargs):
                     return self.response
+
+                def get_stream(self, *args, **kwargs):
+                    return _stream_response(self.get_res(*args, **kwargs))
 
             module.RequestUtils = Request
             cases = (
@@ -718,7 +1054,7 @@ class ProwlarrV3ContractTest(unittest.TestCase):
                 headers={"Content-Type": "application/rss+xml"},
                 text="<rss>",
             )
-            response.content = valid_xml
+            response._wire_content = valid_xml
             with self.assertRaises(ExpatError):
                 xml.dom.minidom.parseString(response.text)
 
@@ -728,6 +1064,9 @@ class ProwlarrV3ContractTest(unittest.TestCase):
 
                 def get_res(self, *_args, **_kwargs):
                     return response
+
+                def get_stream(self, *args, **kwargs):
+                    return _stream_response(self.get_res(*args, **kwargs))
 
             module.RequestUtils = Request
             plugin = object.__new__(module.ProwlarrExtend)
@@ -767,6 +1106,9 @@ class ProwlarrV3ContractTest(unittest.TestCase):
 
                 def get_res(self, *_args, **_kwargs):
                     return self.response
+
+                def get_stream(self, *args, **kwargs):
+                    return _stream_response(self.get_res(*args, **kwargs))
 
             module.RequestUtils = Request
             encodings = (
@@ -829,6 +1171,9 @@ class ProwlarrV3ContractTest(unittest.TestCase):
                 def get_res(self, *_args, **_kwargs):
                     return self.response
 
+                def get_stream(self, *args, **kwargs):
+                    return _stream_response(self.get_res(*args, **kwargs))
+
             module.RequestUtils = Request
             cases = (
                 ("utf-8", "UTF-8", "中文标题"),
@@ -887,6 +1232,154 @@ class ProwlarrV3ContractTest(unittest.TestCase):
 
             plugin._enabled = False
             self.assertEqual(plugin.get_service(), [])
+
+    def test_old_form_request_cannot_publish_cache_after_reload(self):
+        with loaded_module() as module:
+            plugin = object.__new__(module.ProwlarrExtend)
+            plugin._sync_stop_event = threading.Event()
+            plugin._sync_generation = 7
+            plugin._config_snapshot = {
+                "host": "https://old.invalid",
+                "api_key": "old-key",
+                "proxy": False,
+                "timeout": 17,
+            }
+            plugin._indexers_cache = None
+            plugin._indexers_cache_ts = 0.0
+            entered = threading.Event()
+            release = threading.Event()
+
+            def delayed_fetch(config_snapshot=None, generation=None):
+                self.assertEqual(config_snapshot["host"], "https://old.invalid")
+                self.assertEqual(generation, 7)
+                entered.set()
+                self.assertTrue(release.wait(2))
+                return [{"name": "old", "indexer_id": "old"}]
+
+            plugin._ProwlarrExtend__fetch_indexers = delayed_fetch
+            result = []
+            worker = threading.Thread(
+                target=lambda: result.append(plugin.get_form()),
+            )
+            worker.start()
+            self.assertTrue(entered.wait(2))
+
+            old_event = plugin._sync_stop_event
+            with plugin._state_lock:
+                old_event.set()
+                plugin._sync_generation = 8
+                plugin._sync_stop_event = threading.Event()
+                plugin._config_snapshot = {
+                    "host": "https://new.invalid",
+                    "api_key": "new-key",
+                    "proxy": False,
+                    "timeout": 19,
+                }
+                plugin._indexers_cache = [{"name": "new", "indexer_id": "new"}]
+                plugin._indexers_cache_ts = 123.0
+
+            release.set()
+            worker.join(2)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(plugin._indexers_cache, [{"name": "new", "indexer_id": "new"}])
+            self.assertEqual(plugin._indexers_cache_ts, 123.0)
+
+    def test_old_form_failure_cannot_refresh_new_cache_timestamp_or_error(self):
+        with loaded_module() as module:
+            plugin = object.__new__(module.ProwlarrExtend)
+            plugin._sync_stop_event = threading.Event()
+            plugin._sync_generation = 11
+            plugin._config_snapshot = {
+                "host": "https://old.invalid",
+                "api_key": "old-key",
+                "proxy": False,
+                "timeout": 17,
+            }
+            plugin._indexers_cache = [{"name": "old", "indexer_id": "old"}]
+            plugin._indexers_cache_ts = 1.0
+            entered = threading.Event()
+            release = threading.Event()
+
+            def delayed_failure(config_snapshot=None, generation=None):
+                entered.set()
+                self.assertTrue(release.wait(2))
+                plugin._record_error("old_failure", generation=generation)
+                return None
+
+            plugin._ProwlarrExtend__fetch_indexers = delayed_failure
+            result = []
+            worker = threading.Thread(
+                target=lambda: result.append(plugin.get_form()),
+            )
+            worker.start()
+            self.assertTrue(entered.wait(2))
+
+            old_event = plugin._sync_stop_event
+            with plugin._state_lock:
+                old_event.set()
+                plugin._sync_generation = 12
+                plugin._sync_stop_event = threading.Event()
+                plugin._indexers_cache = [{"name": "new", "indexer_id": "new"}]
+                plugin._indexers_cache_ts = 456.0
+                plugin._last_error = "new_failure"
+                plugin._last_error_at = 456.0
+
+            release.set()
+            worker.join(2)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(plugin._indexers_cache, [{"name": "new", "indexer_id": "new"}])
+            self.assertEqual(plugin._indexers_cache_ts, 456.0)
+            self.assertEqual(plugin._last_error, "new_failure")
+            self.assertEqual(plugin._last_error_at, 456.0)
+
+    def test_old_page_request_cannot_publish_sites_after_reload(self):
+        with loaded_module() as module:
+            plugin = object.__new__(module.ProwlarrExtend)
+            plugin._sync_stop_event = threading.Event()
+            plugin._sync_generation = 15
+            plugin._config_snapshot = {
+                "host": "https://old.invalid",
+                "api_key": "old-key",
+                "proxy": False,
+                "timeout": 17,
+            }
+            plugin._indexers = []
+            plugin._fetch_ok = False
+            plugin._indexers_cache = None
+            plugin._indexers_cache_ts = 0.0
+            entered = threading.Event()
+            release = threading.Event()
+
+            def delayed_fetch(config_snapshot=None, generation=None):
+                entered.set()
+                self.assertTrue(release.wait(2))
+                return [{"id": "old", "domain": "prowlarr_extend.old"}]
+
+            plugin._ProwlarrExtend__fetch_indexers = delayed_fetch
+            result = []
+            worker = threading.Thread(
+                target=lambda: result.append(plugin.get_page()),
+            )
+            worker.start()
+            self.assertTrue(entered.wait(2))
+
+            old_event = plugin._sync_stop_event
+            with plugin._state_lock:
+                old_event.set()
+                plugin._sync_generation = 16
+                plugin._sync_stop_event = threading.Event()
+                plugin._indexers = [{"id": "new", "domain": "prowlarr_extend.new"}]
+                plugin._fetch_ok = True
+
+            release.set()
+            worker.join(2)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(
+                plugin._indexers,
+                [{"id": "new", "domain": "prowlarr_extend.new"}],
+            )
+            self.assertTrue(plugin._fetch_ok)
+            self.assertEqual(result, [[]])
 
     def test_lifecycle_cleanup_deletes_only_prowlarr_sites_and_is_idempotent(self):
         with loaded_module() as module:
@@ -992,7 +1485,7 @@ class ProwlarrV3ContractTest(unittest.TestCase):
                 ("SiteDeleted", {"site_id": 1}),
             ])
 
-    def test_stop_service_cleans_sites_and_marks_plugin_disabled(self):
+    def test_stop_service_quiesces_without_deleting_sites(self):
         with loaded_module() as module:
             records = [types.SimpleNamespace(id=1, domain="prowlarr_extend.7")]
             state = types.SimpleNamespace(deleted=[])
@@ -1019,10 +1512,166 @@ class ProwlarrV3ContractTest(unittest.TestCase):
 
             self.assertTrue(result)
             self.assertFalse(plugin.get_state())
-            self.assertEqual(state.deleted, [1])
-            self.assertEqual(calls, [
-                ("SiteDeleted", {"site_id": 1}),
-            ])
+            self.assertEqual(state.deleted, [])
+            self.assertEqual(calls, [])
+
+    def test_stop_service_waits_for_commit_lock_before_returning(self):
+        with loaded_module() as module:
+            plugin = object.__new__(module.ProwlarrExtend)
+            plugin._enabled = True
+            plugin._sync_stop_event = threading.Event()
+            plugin._sync_thread = None
+            commit_entered = threading.Event()
+            release_commit = threading.Event()
+
+            def hold_commit_lock():
+                with plugin._sync_lock:
+                    commit_entered.set()
+                    release_commit.wait(2)
+
+            commit_worker = threading.Thread(target=hold_commit_lock)
+            commit_worker.start()
+            self.assertTrue(commit_entered.wait(2))
+            stop_returned = threading.Event()
+            stop_worker = threading.Thread(
+                target=lambda: (plugin.stop_service(), stop_returned.set()),
+            )
+            stop_worker.start()
+            try:
+                self.assertFalse(stop_returned.wait(0.05))
+            finally:
+                release_commit.set()
+            self.assertTrue(stop_returned.wait(2))
+            commit_worker.join(2)
+            stop_worker.join(2)
+            self.assertFalse(commit_worker.is_alive())
+            self.assertFalse(stop_worker.is_alive())
+
+    def test_stop_service_does_not_wait_for_blocked_network_worker(self):
+        with loaded_module() as module:
+            plugin = object.__new__(module.ProwlarrExtend)
+            plugin._enabled = True
+            plugin._sync_stop_event = threading.Event()
+            network_entered = threading.Event()
+            release_network = threading.Event()
+
+            def blocked_network_request():
+                network_entered.set()
+                release_network.wait(2)
+
+            network_worker = threading.Thread(target=blocked_network_request)
+            plugin._sync_thread = network_worker
+            network_worker.start()
+            self.assertTrue(network_entered.wait(2))
+            stop_returned = threading.Event()
+            stop_worker = threading.Thread(
+                target=lambda: (plugin.stop_service(), stop_returned.set()),
+            )
+            stop_worker.start()
+            try:
+                self.assertTrue(stop_returned.wait(1))
+                self.assertFalse(release_network.is_set())
+            finally:
+                release_network.set()
+            stop_worker.join(2)
+            network_worker.join(2)
+            self.assertFalse(stop_worker.is_alive())
+            self.assertFalse(network_worker.is_alive())
+
+    def test_host_stop_then_init_preserves_site_identity_and_user_fields(self):
+        with loaded_module() as module:
+            class FakeCronTrigger:
+                @classmethod
+                def from_crontab(cls, _expression, timezone=None):
+                    return cls()
+
+            class FakeThread:
+                def __init__(self, target, kwargs, name, daemon):
+                    self.target = target
+                    self.kwargs = kwargs
+                    self.name = name
+                    self.daemon = daemon
+
+                def start(self):
+                    return None
+
+                def is_alive(self):
+                    return False
+
+                def join(self, timeout=None):
+                    return None
+
+            record = types.SimpleNamespace(
+                id=91,
+                domain="prowlarr_extend.7",
+                name="Old name",
+                pri=7,
+                is_active=False,
+                downloader="keep-downloader",
+                proxy=1,
+                references={"search": [91], "subscribe": [91]},
+            )
+            state = types.SimpleNamespace(deleted=[], updates=[])
+
+            class FakeSiteOper:
+                def list(self):
+                    return [record]
+
+                def get_by_domain(self, _domain):
+                    return record
+
+                def update(self, site_id, payload):
+                    state.updates.append((site_id, payload))
+                    for key, value in payload.items():
+                        setattr(record, key, value)
+
+            class EventManager:
+                def send_event(self, _event, _payload):
+                    return None
+
+            event_type = types.SimpleNamespace(SiteUpdated="SiteUpdated")
+            module.CronTrigger = FakeCronTrigger
+            module.threading = types.SimpleNamespace(
+                Event=threading.Event,
+                Thread=FakeThread,
+                current_thread=threading.current_thread,
+            )
+            old_plugin = object.__new__(module.ProwlarrExtend)
+            old_plugin._enabled = True
+            old_plugin._sync_stop_event = threading.Event()
+            old_plugin._sync_generation = 3
+            old_plugin._sync_thread = None
+            new_plugin = object.__new__(module.ProwlarrExtend)
+
+            with site_oper_modules(FakeSiteOper, EventManager(), event_type):
+                old_plugin.stop_service()
+                new_plugin.init_plugin({
+                    "enabled": True,
+                    "host": "https://prowlarr.invalid",
+                    "api_key": "key",
+                })
+                self.assertTrue(new_plugin._ProwlarrExtend__register_site({
+                    "name": "New name",
+                    "domain": "prowlarr_extend.7",
+                    "public": True,
+                    "proxy": False,
+                }, generation=new_plugin._sync_generation))
+
+            self.assertEqual(state.deleted, [])
+            self.assertEqual(record.id, 91)
+            self.assertEqual(record.pri, 7)
+            self.assertFalse(record.is_active)
+            self.assertEqual(record.downloader, "keep-downloader")
+            self.assertEqual(record.proxy, 1)
+            self.assertEqual(record.references, {"search": [91], "subscribe": [91]})
+            self.assertEqual(state.updates, [(
+                91,
+                {
+                    "name": "New name",
+                    "url": "https://prowlarr_extend.7/",
+                    "public": 1,
+                },
+            )])
 
 
 if __name__ == "__main__":

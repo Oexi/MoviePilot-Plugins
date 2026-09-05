@@ -27,6 +27,10 @@ MIRRORS = {
         ROOT / "plugins.v3" / "jackettextend" / "_torznab_core.py",
         ROOT / "plugins.v3" / "prowlarrextend" / "_torznab_core.py",
     ),
+    ROOT / "shared" / "_response.py": (
+        ROOT / "plugins.v3" / "jackettextend" / "_response.py",
+        ROOT / "plugins.v3" / "prowlarrextend" / "_response.py",
+    ),
 }
 
 

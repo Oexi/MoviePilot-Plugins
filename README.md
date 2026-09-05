@@ -6,7 +6,7 @@ MoviePilot 插件仓库，当前仅提供 **MoviePilot V3** 插件。
 
 ### JackettExtend
 
-- **版本**：3.2.17
+- **版本**：3.2.19
 - **适用版本**：MoviePilot V3
 - **功能**：
   - 同步 Jackett 中已配置的 indexer，并在 MoviePilot 中生成对应站点
@@ -14,18 +14,18 @@ MoviePilot 插件仓库，当前仅提供 **MoviePilot V3** 插件。
   - 支持 Jackett 登录密码、代理和搜索超时配置
   - 支持 indexer 白名单和定时同步
   - 支持站点状态、索引器类型和搜索结果展示
-  - 插件禁用或停止时自动清理自身生成的虚拟站点
+  - 普通停止、宿主关闭和热重载保留虚拟站点及用户设置；明确禁用时清理自身站点
 
 ### ProwlarrExtend
 
-- **版本**：1.0.4
+- **版本**：1.0.6
 - **适用版本**：MoviePilot V3
 - **功能**：
   - 同步 Prowlarr 中已启用且支持搜索的 Torrent indexer，并在 MoviePilot 中生成对应站点
   - 通过 Prowlarr Torznab API 搜索电影、电视剧和音乐资源
   - 支持代理、搜索超时、indexer 白名单和定时同步
   - 可与 JackettExtend 同时启用，分别管理各自的虚拟站点
-  - 插件禁用或停止时自动清理自身生成的虚拟站点
+  - 普通停止、宿主关闭和热重载保留虚拟站点及用户设置；明确禁用时清理自身站点
 
 ## 安装与配置
 
@@ -36,6 +36,8 @@ MoviePilot 插件仓库，当前仅提供 **MoviePilot V3** 插件。
 4. 保存配置。插件会同步所选服务的 indexer，并将可用站点交给 MoviePilot 管理。
 
 配置前应先在对应服务中添加 indexer。JackettExtend 可额外配置 Web 登录密码；ProwlarrExtend 只同步已启用、支持搜索且协议为 Torrent 的 indexer。站点同步完成后，可在 MoviePilot 的站点管理中查看和启用对应站点。
+
+卸载前如需清理虚拟站点，请先关闭插件的启用开关并保存，确认清理完成后再卸载。当前宿主没有独立的卸载回调；直接卸载会保留站点记录，避免把热重载或宿主关闭误判为永久删除。明确禁用会发送 `SiteDeleted`，宿主将清理相应的搜索和订阅站点引用。
 
 ## 版本说明
 

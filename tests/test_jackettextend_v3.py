@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import requests
+from urllib3.exceptions import ReadTimeoutError
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,6 +68,56 @@ class _Response:
     status_code = 200
     headers = {"Content-Type": "application/xml"}
     text = ""
+    wire_content = None
+    closed = False
+
+    def iter_content(self, chunk_size=1):
+        body = self.wire_content
+        if body is None:
+            body = self.text.encode("utf-8")
+        yield body
+
+    def close(self):
+        self.closed = True
+
+
+class _GuardedResponse:
+    """Streaming double that fails if production reads buffered properties."""
+
+    def __init__(self, chunks, status_code=200, headers=None, error=None):
+        self.status_code = status_code
+        self.headers = headers or {"Content-Type": "application/xml"}
+        self._chunks = tuple(chunks)
+        self._error = error
+        self.iterated_chunks = 0
+        self.closed = False
+
+    @property
+    def content(self):
+        raise AssertionError("streaming code must not read response.content")
+
+    @property
+    def text(self):
+        raise AssertionError("streaming code must not read response.text")
+
+    def iter_content(self, chunk_size=1):
+        for chunk in self._chunks:
+            self.iterated_chunks += 1
+            yield chunk
+        if self._error is not None:
+            raise self._error
+
+    def close(self):
+        self.closed = True
+
+
+@contextmanager
+def _stream_response(response):
+    try:
+        yield response
+    finally:
+        if response is not None:
+            response.close()
 
 
 def _real_xml_response(content):
@@ -79,6 +130,20 @@ def _real_xml_response(content):
     return response
 
 
+def _real_stream_response(stream_factory, headers):
+    """Build a real response whose raw stream is controlled by a test."""
+    close_calls = []
+    response = requests.Response()
+    response.status_code = 200
+    response.headers = headers
+    response.raw = types.SimpleNamespace(
+        stream=lambda *_args, **_kwargs: stream_factory(),
+        close=lambda: close_calls.append(True),
+    )
+    response._content_consumed = False
+    return response, close_calls
+
+
 class _RequestUtils:
     response = _Response()
     timeouts = []
@@ -88,6 +153,9 @@ class _RequestUtils:
 
     def get_res(self, *args, **kwargs):
         return self.response
+
+    def get_stream(self, *args, **kwargs):
+        return _stream_response(self.get_res(*args, **kwargs))
 
 
 @contextmanager
@@ -415,7 +483,7 @@ class JackettV3ContractTest(unittest.TestCase):
     def test_get_form_preserves_configuration_models_options_and_description(self):
         with loaded_module() as module:
             plugin = object.__new__(module.JackettExtend)
-            plugin.get_indexers = lambda filter_selected=False: [
+            plugin.get_indexers = lambda filter_selected=False, **_kwargs: [
                 {"name": "Nyaa", "indexer_id": "nyaa"},
             ]
 
@@ -494,8 +562,160 @@ class JackettV3ContractTest(unittest.TestCase):
                 ["JackettExtend-Nyaa", "https://jackett_extend.nyaa/", "半公开"],
             )
 
-            plugin._ensure_sites_loaded = lambda: False
+            plugin._ensure_sites_loaded = lambda **_kwargs: False
             self.assertEqual(plugin.get_page(), [])
+
+    def test_old_form_request_cannot_publish_cache_after_reload(self):
+        with loaded_module() as module:
+            plugin = object.__new__(module.JackettExtend)
+            plugin._sync_stop_event = threading.Event()
+            plugin._sync_generation = 7
+            plugin._config_snapshot = {
+                "host": "https://old.invalid",
+                "api_key": "old-key",
+                "password": "",
+                "proxy": False,
+                "timeout": 17,
+            }
+            plugin._indexers_cache = None
+            plugin._indexers_cache_ts = 0.0
+            entered = threading.Event()
+            release = threading.Event()
+
+            def delayed_fetch(config_snapshot=None, generation=None):
+                self.assertEqual(config_snapshot["host"], "https://old.invalid")
+                self.assertEqual(generation, 7)
+                entered.set()
+                self.assertTrue(release.wait(2))
+                return [{"name": "old", "indexer_id": "old"}]
+
+            plugin._JackettExtend__fetch_indexers = delayed_fetch
+            result = []
+            worker = threading.Thread(
+                target=lambda: result.append(plugin.get_form()),
+            )
+            worker.start()
+            self.assertTrue(entered.wait(2))
+
+            old_event = plugin._sync_stop_event
+            with plugin._state_lock:
+                old_event.set()
+                plugin._sync_generation = 8
+                plugin._sync_stop_event = threading.Event()
+                plugin._config_snapshot = {
+                    "host": "https://new.invalid",
+                    "api_key": "new-key",
+                    "password": "",
+                    "proxy": False,
+                    "timeout": 19,
+                }
+                plugin._indexers_cache = [{"name": "new", "indexer_id": "new"}]
+                plugin._indexers_cache_ts = 123.0
+
+            release.set()
+            worker.join(2)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(plugin._indexers_cache, [{"name": "new", "indexer_id": "new"}])
+            self.assertEqual(plugin._indexers_cache_ts, 123.0)
+
+    def test_old_form_failure_cannot_refresh_new_cache_timestamp_or_error(self):
+        with loaded_module() as module:
+            plugin = object.__new__(module.JackettExtend)
+            plugin._sync_stop_event = threading.Event()
+            plugin._sync_generation = 11
+            plugin._config_snapshot = {
+                "host": "https://old.invalid",
+                "api_key": "old-key",
+                "password": "",
+                "proxy": False,
+                "timeout": 17,
+            }
+            plugin._indexers_cache = [{"name": "old", "indexer_id": "old"}]
+            plugin._indexers_cache_ts = 1.0
+            entered = threading.Event()
+            release = threading.Event()
+
+            def delayed_failure(config_snapshot=None, generation=None):
+                entered.set()
+                self.assertTrue(release.wait(2))
+                plugin._record_error("old_failure", generation=generation)
+                return None
+
+            plugin._JackettExtend__fetch_indexers = delayed_failure
+            result = []
+            worker = threading.Thread(
+                target=lambda: result.append(plugin.get_form()),
+            )
+            worker.start()
+            self.assertTrue(entered.wait(2))
+
+            old_event = plugin._sync_stop_event
+            with plugin._state_lock:
+                old_event.set()
+                plugin._sync_generation = 12
+                plugin._sync_stop_event = threading.Event()
+                plugin._indexers_cache = [{"name": "new", "indexer_id": "new"}]
+                plugin._indexers_cache_ts = 456.0
+                plugin._last_error = "new_failure"
+                plugin._last_error_at = 456.0
+
+            release.set()
+            worker.join(2)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(plugin._indexers_cache, [{"name": "new", "indexer_id": "new"}])
+            self.assertEqual(plugin._indexers_cache_ts, 456.0)
+            self.assertEqual(plugin._last_error, "new_failure")
+            self.assertEqual(plugin._last_error_at, 456.0)
+
+    def test_old_page_request_cannot_publish_sites_after_reload(self):
+        with loaded_module() as module:
+            plugin = object.__new__(module.JackettExtend)
+            plugin._sync_stop_event = threading.Event()
+            plugin._sync_generation = 15
+            plugin._config_snapshot = {
+                "host": "https://old.invalid",
+                "api_key": "old-key",
+                "password": "",
+                "proxy": False,
+                "timeout": 17,
+            }
+            plugin._indexers = []
+            plugin._fetch_ok = False
+            plugin._indexers_cache = None
+            plugin._indexers_cache_ts = 0.0
+            entered = threading.Event()
+            release = threading.Event()
+
+            def delayed_fetch(config_snapshot=None, generation=None):
+                entered.set()
+                self.assertTrue(release.wait(2))
+                return [{"id": "old", "domain": "jackett_extend.old"}]
+
+            plugin._JackettExtend__fetch_indexers = delayed_fetch
+            result = []
+            worker = threading.Thread(
+                target=lambda: result.append(plugin.get_page()),
+            )
+            worker.start()
+            self.assertTrue(entered.wait(2))
+
+            old_event = plugin._sync_stop_event
+            with plugin._state_lock:
+                old_event.set()
+                plugin._sync_generation = 16
+                plugin._sync_stop_event = threading.Event()
+                plugin._indexers = [{"id": "new", "domain": "jackett_extend.new"}]
+                plugin._fetch_ok = True
+
+            release.set()
+            worker.join(2)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(
+                plugin._indexers,
+                [{"id": "new", "domain": "jackett_extend.new"}],
+            )
+            self.assertTrue(plugin._fetch_ok)
+            self.assertEqual(result, [[]])
 
     def test_ui_builders_are_host_independent_and_do_not_mutate_inputs(self):
         with isolated_ui_module() as ui:
@@ -560,6 +780,7 @@ class JackettV3ContractTest(unittest.TestCase):
                 status_code = 200
                 headers = {"Content-Type": "application/json"}
                 text = "[]"
+                closed = False
 
                 @staticmethod
                 def json():
@@ -568,12 +789,26 @@ class JackettV3ContractTest(unittest.TestCase):
                         {"id": "foo.bar/baz", "name": "Special", "type": "public", "caps": []},
                     ]
 
+                @staticmethod
+                def iter_content(chunk_size=1):
+                    yield json.dumps([
+                        None,
+                        {"id": "foo.bar/baz", "name": "Special", "type": "public", "caps": []},
+                    ]).encode("utf-8")
+
+                @classmethod
+                def close(cls):
+                    cls.closed = True
+
             class Request:
                 def __init__(self, *args, **kwargs):
                     self.kwargs = kwargs
 
                 def get_res(self, *_args, **_kwargs):
                     return Response()
+
+                def get_stream(self, *args, **kwargs):
+                    return _stream_response(self.get_res(*args, **kwargs))
 
             original = module.RequestUtils
             module.RequestUtils = Request
@@ -615,10 +850,21 @@ class JackettV3ContractTest(unittest.TestCase):
             class Response:
                 status_code = 200
                 headers = {"Content-Type": "application/json"}
+                closed = False
 
                 @staticmethod
                 def json():
                     return [{"id": "nyaa", "name": "Nyaa", "type": "public", "caps": []}]
+
+                @staticmethod
+                def iter_content(chunk_size=1):
+                    yield json.dumps([
+                        {"id": "nyaa", "name": "Nyaa", "type": "public", "caps": []},
+                    ]).encode("utf-8")
+
+                @classmethod
+                def close(cls):
+                    cls.closed = True
 
             class Request:
                 mode = "normal"
@@ -637,6 +883,9 @@ class JackettV3ContractTest(unittest.TestCase):
                             "https://jackett.invalid/?apikey=secret-key&q=private-title"
                         )
                     return self.response
+
+                def get_stream(self, *args, **kwargs):
+                    return _stream_response(self.get_res(*args, **kwargs))
 
             module.RequestUtils = Request
             cases = (
@@ -691,6 +940,15 @@ class JackettV3ContractTest(unittest.TestCase):
                     "<enclosure url='https://site/release.torrent'/></item>"
                     "</channel></rss>"
                 )
+                closed = False
+
+                @classmethod
+                def iter_content(cls, chunk_size=1):
+                    yield cls.text.encode("utf-8")
+
+                @classmethod
+                def close(cls):
+                    cls.closed = True
 
             class Request:
                 mode = "normal"
@@ -709,6 +967,9 @@ class JackettV3ContractTest(unittest.TestCase):
                             "https://jackett.invalid/?apikey=secret-key&q=private-title"
                         )
                     return self.response
+
+                def get_stream(self, *args, **kwargs):
+                    return _stream_response(self.get_res(*args, **kwargs))
 
             module.RequestUtils = Request
             cases = (
@@ -733,6 +994,297 @@ class JackettV3ContractTest(unittest.TestCase):
             rendered_logs = " ".join(logs)
             self.assertNotIn("secret-key", rendered_logs)
             self.assertNotIn("private-title", rendered_logs)
+
+    def test_streaming_xml_and_rest_reads_never_touch_buffered_body(self):
+        with loaded_module() as module:
+            xml = (
+                '<?xml version="1.0" encoding="UTF-16"?><rss><channel>'
+                "<item><title>流式标题</title>"
+                "<enclosure url='https://site/stream.torrent'/></item>"
+                "</channel></rss>"
+            ).encode("utf-16")
+            xml_response = _GuardedResponse(
+                (xml[:7], xml[7:]),
+                headers={"Content-Type": "application/rss+xml"},
+            )
+
+            class XmlRequest:
+                def __init__(self, *args, **kwargs):
+                    self.kwargs = kwargs
+
+                def get_stream(self, *args, **kwargs):
+                    return _stream_response(xml_response)
+
+            module.RequestUtils = XmlRequest
+            plugin = object.__new__(module.JackettExtend)
+            plugin._timeout = 12
+            plugin._proxy = False
+            plugin._last_error = None
+            plugin._state_lock = module.JackettExtend._state_lock
+
+            results = plugin._JackettExtend__parse_torznab_xml(
+                "https://jackett.invalid/results",
+                site={"name": "流式站点"},
+            )
+
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0].title, "流式标题")
+            self.assertTrue(xml_response.closed)
+            self.assertEqual(xml_response.iterated_chunks, 2)
+
+            payload = json.dumps([{
+                "id": "nyaa",
+                "name": "Nyaa",
+                "type": "public",
+                "caps": [],
+            }]).encode("utf-8")
+            rest_response = _GuardedResponse(
+                (payload[:2], payload[2:]),
+                headers={"Content-Type": "application/json"},
+            )
+
+            class RestRequest:
+                def __init__(self, *args, **kwargs):
+                    self.kwargs = kwargs
+
+                def get_stream(self, *args, **kwargs):
+                    return _stream_response(rest_response)
+
+            module.RequestUtils = RestRequest
+            fetch_result = plugin._JackettExtend__fetch_indexers({
+                "host": "https://jackett.invalid",
+                "api_key": "key",
+                "password": "",
+                "proxy": False,
+                "timeout": 12,
+            })
+
+            self.assertEqual([item["indexer_id"] for item in fetch_result], ["nyaa"])
+            self.assertTrue(rest_response.closed)
+            self.assertEqual(rest_response.iterated_chunks, 2)
+
+    def test_streaming_limits_and_read_errors_close_responses(self):
+        with loaded_module() as module:
+            plugin = object.__new__(module.JackettExtend)
+            plugin._timeout = 12
+            plugin._proxy = False
+            plugin._state_lock = module.JackettExtend._state_lock
+            plugin.TORZNAB_MAX_XML_BYTES = 8
+            xml_url = "https://jackett.invalid/results?q=title&apikey=secret"
+
+            class Request:
+                response = None
+
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                def get_stream(self, *args, **kwargs):
+                    return _stream_response(self.response)
+
+            module.RequestUtils = Request
+
+            oversized_xml = _GuardedResponse(
+                (b"x" * (plugin.TORZNAB_MAX_XML_BYTES + 1), b"tail"),
+                headers={"Content-Type": "application/xml"},
+            )
+            Request.response = oversized_xml
+            plugin._last_search_error = None
+            self.assertEqual(plugin._JackettExtend__parse_torznab_xml(xml_url), [])
+            self.assertEqual(plugin._last_search_error, "xml_too_large")
+            self.assertTrue(oversized_xml.closed)
+            self.assertEqual(oversized_xml.iterated_chunks, 1)
+
+            rejected_xml = _GuardedResponse(
+                (),
+                status_code=503,
+                headers={"Content-Type": "application/xml"},
+                error=AssertionError("status rejection must not read the body"),
+            )
+            Request.response = rejected_xml
+            plugin._last_search_error = None
+            self.assertEqual(plugin._JackettExtend__parse_torznab_xml(xml_url), [])
+            self.assertEqual(plugin._last_search_error, "http_503")
+            self.assertTrue(rejected_xml.closed)
+            self.assertEqual(rejected_xml.iterated_chunks, 0)
+
+            truncated_xml = _GuardedResponse(
+                (b"<rss>",),
+                headers={"Content-Type": "application/xml"},
+                error=requests.exceptions.ChunkedEncodingError("truncated"),
+            )
+            Request.response = truncated_xml
+            plugin._last_search_error = None
+            self.assertEqual(plugin._JackettExtend__parse_torznab_xml(xml_url), [])
+            self.assertEqual(plugin._last_search_error, "request_error")
+            self.assertTrue(truncated_xml.closed)
+
+            plugin.REST_MAX_JSON_BYTES = 8
+            oversized_json = _GuardedResponse(
+                (b"123456789", b"tail"),
+                headers={"Content-Type": "application/json"},
+            )
+            Request.response = oversized_json
+            plugin._last_error = None
+            self.assertIsNone(plugin._JackettExtend__fetch_indexers({
+                "host": "https://jackett.invalid",
+                "api_key": "key",
+                "password": "",
+                "proxy": False,
+                "timeout": 12,
+            }))
+            self.assertEqual(plugin._last_error, "json_too_large")
+            self.assertTrue(oversized_json.closed)
+            self.assertEqual(oversized_json.iterated_chunks, 1)
+
+    def test_real_response_read_timeout_is_distinct_from_connection_errors(self):
+        with loaded_module() as module:
+            plugin = object.__new__(module.JackettExtend)
+            plugin._timeout = 12
+            plugin._proxy = False
+            plugin._state_lock = module.JackettExtend._state_lock
+            xml_url = "https://jackett.invalid/results?q=title&apikey=secret"
+
+            def timeout_stream():
+                yield b"<rss>"
+                raise ReadTimeoutError(None, "/test", "timed out")
+
+            xml_response, xml_close_calls = _real_stream_response(
+                timeout_stream,
+                {"Content-Type": "application/xml"},
+            )
+
+            class Request:
+                response = xml_response
+
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                def get_stream(self, *args, **kwargs):
+                    return _stream_response(self.response)
+
+            module.RequestUtils = Request
+            plugin._last_search_error = None
+            self.assertEqual(plugin._JackettExtend__parse_torznab_xml(xml_url), [])
+            self.assertEqual(plugin._last_search_error, "timeout")
+            self.assertEqual(xml_close_calls, [True])
+
+            def timeout_json_stream():
+                yield b"["
+                raise ReadTimeoutError(None, "/test", "timed out")
+
+            json_response, json_close_calls = _real_stream_response(
+                timeout_json_stream,
+                {"Content-Type": "application/json"},
+            )
+            Request.response = json_response
+            plugin._last_error = None
+            self.assertIsNone(plugin._JackettExtend__fetch_indexers({
+                "host": "https://jackett.invalid",
+                "api_key": "key",
+                "password": "",
+                "proxy": False,
+                "timeout": 12,
+            }))
+            self.assertEqual(plugin._last_error, "timeout")
+            self.assertEqual(json_close_calls, [True])
+
+            def connection_stream():
+                yield b"<rss>"
+                raise requests.ConnectionError("ordinary connection failure")
+
+            connection_response, connection_close_calls = _real_stream_response(
+                connection_stream,
+                {"Content-Type": "application/xml"},
+            )
+            Request.response = connection_response
+            plugin._last_search_error = None
+            self.assertEqual(plugin._JackettExtend__parse_torznab_xml(xml_url), [])
+            self.assertEqual(plugin._last_search_error, "request_error")
+            self.assertEqual(connection_close_calls, [True])
+
+            def chunk_stream():
+                yield b"["
+                raise requests.exceptions.ChunkedEncodingError("truncated")
+
+            chunk_response, chunk_close_calls = _real_stream_response(
+                chunk_stream,
+                {"Content-Type": "application/json"},
+            )
+            Request.response = chunk_response
+            plugin._last_error = None
+            self.assertIsNone(plugin._JackettExtend__fetch_indexers({
+                "host": "https://jackett.invalid",
+                "api_key": "key",
+                "password": "",
+                "proxy": False,
+                "timeout": 12,
+            }))
+            self.assertEqual(plugin._last_error, "request_error")
+            self.assertEqual(chunk_close_calls, [True])
+
+    def test_password_login_uses_streaming_response_and_reuses_session_cookies(self):
+        with loaded_module() as module:
+            class Cookies:
+                def __bool__(self):
+                    return True
+
+                def get_dict(self):
+                    return {"jackett-session": "opaque"}
+
+            class Session:
+                def __init__(self):
+                    self.cookies = Cookies()
+                    self.closed = False
+
+                def close(self):
+                    self.closed = True
+
+            session = Session()
+            login_response = _GuardedResponse((), headers={"Content-Type": "text/html"})
+            indexer_response = _GuardedResponse(
+                (json.dumps([{
+                    "id": "nyaa",
+                    "name": "Nyaa",
+                    "type": "public",
+                    "caps": [],
+                }]).encode("utf-8"),),
+                headers={"Content-Type": "application/json"},
+            )
+            calls = []
+
+            class Request:
+                def __init__(self, *args, **kwargs):
+                    calls.append(("init", kwargs))
+
+                def post_res(self, *args, **kwargs):
+                    calls.append(("post", args, kwargs))
+                    return login_response
+
+                def get_stream(self, *args, **kwargs):
+                    calls.append(("get_stream", args, kwargs))
+                    return _stream_response(indexer_response)
+
+            original_session_factory = module.requests.session
+            module.requests.session = lambda: session
+            module.RequestUtils = Request
+            try:
+                result = object.__new__(module.JackettExtend)._JackettExtend__fetch_indexers({
+                    "host": "https://jackett.invalid",
+                    "api_key": "key",
+                    "password": "admin-password",
+                    "proxy": False,
+                    "timeout": 23,
+                })
+            finally:
+                module.requests.session = original_session_factory
+
+            self.assertEqual([item["indexer_id"] for item in result], ["nyaa"])
+            self.assertTrue(login_response.closed)
+            self.assertTrue(indexer_response.closed)
+            self.assertTrue(session.closed)
+            self.assertEqual(calls[0][1]["session"], session)
+            self.assertEqual(calls[1][2]["stream"], True)
+            self.assertEqual(calls[2][1]["cookies"], {"jackett-session": "opaque"})
 
     def test_finite_all_stale_whitelist_never_becomes_all(self):
         with loaded_module() as module:
@@ -1013,10 +1565,10 @@ class JackettV3ContractTest(unittest.TestCase):
                 "</item></channel></rss>"
             )
             response = _Response()
-            response.content = xml.encode("iso-8859-1")
+            response.wire_content = xml.encode("iso-8859-1")
             # Simulate an HTTP charset guess that decoded the wire bytes as
             # UTF-8 before the parser received the response.
-            response.text = response.content.decode("utf-8", errors="replace")
+            response.text = response.wire_content.decode("utf-8", errors="replace")
             _RequestUtils.response = response
             plugin = object.__new__(module.JackettExtend)
             plugin._timeout = 12
@@ -1032,7 +1584,7 @@ class JackettV3ContractTest(unittest.TestCase):
             self.assertEqual(len(result), 1)
             self.assertEqual(result[0].title, title)
 
-    def test_parser_falls_back_to_text_when_response_has_no_content(self):
+    def test_parser_reads_stream_body_when_response_has_no_buffered_body(self):
         with loaded_module() as module:
             response = _Response()
             response.text = (
@@ -1066,7 +1618,7 @@ class JackettV3ContractTest(unittest.TestCase):
                 "</item></channel></rss>"
             )
             response = _Response()
-            response.content = xml.encode("utf-8")
+            response.wire_content = xml.encode("utf-8")
             response.text = ""
             _RequestUtils.response = response
             plugin = object.__new__(module.JackettExtend)
@@ -1099,6 +1651,9 @@ class JackettV3ContractTest(unittest.TestCase):
 
                 def get_res(self, *_args, **_kwargs):
                     return self.response
+
+                def get_stream(self, *args, **kwargs):
+                    return _stream_response(self.get_res(*args, **kwargs))
 
             module.RequestUtils = Request
             encodings = (
@@ -1156,6 +1711,9 @@ class JackettV3ContractTest(unittest.TestCase):
 
                 def get_res(self, *_args, **_kwargs):
                     return self.response
+
+                def get_stream(self, *args, **kwargs):
+                    return _stream_response(self.get_res(*args, **kwargs))
 
             module.RequestUtils = Request
             cases = (
@@ -1428,7 +1986,7 @@ class JackettV3ContractTest(unittest.TestCase):
     def test_parser_applies_size_limit_to_raw_content(self):
         with loaded_module() as module:
             response = _Response()
-            response.content = (
+            response.wire_content = (
                 b"<rss><channel>"
                 + b"x" * (module.JackettExtend.TORZNAB_MAX_XML_BYTES + 1)
                 + b"</channel></rss>"
@@ -2001,7 +2559,7 @@ class JackettSyncBoundaryTest(unittest.TestCase):
                 ("SiteDeleted", {"site_id": 1}),
             ])
 
-    def test_stop_service_cleans_sites_and_marks_plugin_disabled(self):
+    def test_stop_service_quiesces_without_deleting_sites(self):
         with loaded_module() as module:
             records = [types.SimpleNamespace(id=1, domain="jackett_extend.nyaa")]
             state = types.SimpleNamespace(deleted=[])
@@ -2023,10 +2581,166 @@ class JackettSyncBoundaryTest(unittest.TestCase):
 
             self.assertTrue(result)
             self.assertFalse(plugin.get_state())
-            self.assertEqual(state.deleted, [1])
-            self.assertEqual(events.calls, [
-                ("SiteDeleted", {"site_id": 1}),
-            ])
+            self.assertEqual(state.deleted, [])
+            self.assertEqual(events.calls, [])
+
+    def test_stop_service_waits_for_commit_lock_before_returning(self):
+        with loaded_module() as module:
+            plugin = object.__new__(module.JackettExtend)
+            plugin._enabled = True
+            plugin._sync_stop_event = threading.Event()
+            plugin._sync_thread = None
+            commit_entered = threading.Event()
+            release_commit = threading.Event()
+
+            def hold_commit_lock():
+                with plugin._sync_lock:
+                    commit_entered.set()
+                    release_commit.wait(2)
+
+            commit_worker = threading.Thread(target=hold_commit_lock)
+            commit_worker.start()
+            self.assertTrue(commit_entered.wait(2))
+            stop_returned = threading.Event()
+            stop_worker = threading.Thread(
+                target=lambda: (plugin.stop_service(), stop_returned.set()),
+            )
+            stop_worker.start()
+            try:
+                self.assertFalse(stop_returned.wait(0.05))
+            finally:
+                release_commit.set()
+            self.assertTrue(stop_returned.wait(2))
+            commit_worker.join(2)
+            stop_worker.join(2)
+            self.assertFalse(commit_worker.is_alive())
+            self.assertFalse(stop_worker.is_alive())
+
+    def test_stop_service_does_not_wait_for_blocked_network_worker(self):
+        with loaded_module() as module:
+            plugin = object.__new__(module.JackettExtend)
+            plugin._enabled = True
+            plugin._sync_stop_event = threading.Event()
+            network_entered = threading.Event()
+            release_network = threading.Event()
+
+            def blocked_network_request():
+                network_entered.set()
+                release_network.wait(2)
+
+            network_worker = threading.Thread(target=blocked_network_request)
+            plugin._sync_thread = network_worker
+            network_worker.start()
+            self.assertTrue(network_entered.wait(2))
+            stop_returned = threading.Event()
+            stop_worker = threading.Thread(
+                target=lambda: (plugin.stop_service(), stop_returned.set()),
+            )
+            stop_worker.start()
+            try:
+                self.assertTrue(stop_returned.wait(1))
+                self.assertFalse(release_network.is_set())
+            finally:
+                release_network.set()
+            stop_worker.join(2)
+            network_worker.join(2)
+            self.assertFalse(stop_worker.is_alive())
+            self.assertFalse(network_worker.is_alive())
+
+    def test_host_stop_then_init_preserves_site_identity_and_user_fields(self):
+        with loaded_module() as module:
+            class FakeCronTrigger:
+                @classmethod
+                def from_crontab(cls, _expression, timezone=None):
+                    return cls()
+
+            class FakeThread:
+                def __init__(self, target, kwargs, name, daemon):
+                    self.target = target
+                    self.kwargs = kwargs
+                    self.name = name
+                    self.daemon = daemon
+
+                def start(self):
+                    return None
+
+                def is_alive(self):
+                    return False
+
+                def join(self, timeout=None):
+                    return None
+
+            record = types.SimpleNamespace(
+                id=91,
+                domain="jackett_extend.nyaa",
+                name="Old name",
+                pri=7,
+                is_active=False,
+                downloader="keep-downloader",
+                proxy=1,
+                references={"search": [91], "subscribe": [91]},
+            )
+            state = types.SimpleNamespace(deleted=[], updates=[])
+
+            class FakeSiteOper:
+                def list(self):
+                    return [record]
+
+                def get_by_domain(self, _domain):
+                    return record
+
+                def update(self, site_id, payload):
+                    state.updates.append((site_id, payload))
+                    for key, value in payload.items():
+                        setattr(record, key, value)
+
+            class EventManager:
+                def send_event(self, _event, _payload):
+                    return None
+
+            event_type = types.SimpleNamespace(SiteUpdated="SiteUpdated")
+            module.CronTrigger = FakeCronTrigger
+            module.threading = types.SimpleNamespace(
+                Event=threading.Event,
+                Thread=FakeThread,
+                current_thread=threading.current_thread,
+            )
+            old_plugin = object.__new__(module.JackettExtend)
+            old_plugin._enabled = True
+            old_plugin._sync_stop_event = threading.Event()
+            old_plugin._sync_generation = 3
+            old_plugin._sync_thread = None
+            new_plugin = object.__new__(module.JackettExtend)
+
+            with site_oper_modules(FakeSiteOper, EventManager(), event_type):
+                old_plugin.stop_service()
+                new_plugin.init_plugin({
+                    "enabled": True,
+                    "host": "https://jackett.invalid",
+                    "api_key": "key",
+                })
+                self.assertTrue(new_plugin._JackettExtend__register_site({
+                    "name": "New name",
+                    "domain": "jackett_extend.nyaa",
+                    "public": True,
+                    "proxy": False,
+                }, generation=new_plugin._sync_generation))
+
+            self.assertEqual(state.deleted, [])
+            self.assertEqual(record.id, 91)
+            self.assertEqual(record.pri, 7)
+            self.assertFalse(record.is_active)
+            self.assertEqual(record.downloader, "keep-downloader")
+            self.assertEqual(record.proxy, 1)
+            self.assertEqual(record.references, {"search": [91], "subscribe": [91]})
+            self.assertEqual(state.updates, [(
+                91,
+                {
+                    "name": "New name",
+                    "url": "https://jackett_extend.nyaa/",
+                    "public": 1,
+                },
+            )])
 
     def test_reload_uses_real_stop_and_replaces_generation_event(self):
         with loaded_module() as module:
@@ -2094,7 +2808,7 @@ class JackettSyncBoundaryTest(unittest.TestCase):
 
             plugin.stop_service()
             self.assertTrue(second_event.is_set())
-            self.assertEqual(cleanup_calls, [True])
+            self.assertEqual(cleanup_calls, [])
 
 
 if __name__ == "__main__":

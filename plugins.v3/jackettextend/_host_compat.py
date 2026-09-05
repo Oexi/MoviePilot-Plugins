@@ -37,7 +37,7 @@ _STATE_ATTR = "__jackett_extend_host_compat_state__"
 # The ABI marker must be a process-stable value.  A module-local object (the
 # old implementation's token) makes every module reload look incompatible and
 # causes the second copy to tear down the first copy's bridge.
-_BRIDGE_ABI = 4
+_BRIDGE_ABI = 5
 _BRIDGE_ID = "jackett_extend_host_compat"
 # Keep the old name available for callers/tests that inspected it.  It is a
 # value, not an identity token, and is intentionally equal in every module
@@ -486,18 +486,52 @@ def _site_from_call(args: tuple, kwargs: dict):
     return args[1] if len(args) > 1 else None
 
 
+def _owner_call_arguments(signature: inspect.Signature, args: tuple, kwargs: dict):
+    """Bind host arguments before relaying them to a plugin owner.
+
+    Host and plugin method signatures use the same parameter names but not the
+    same positional order: plugin search methods include ``cat`` before
+    ``page``, while the host refresh method places ``mtype`` last.  Binding
+    against the original host signature makes mixed and keyword calls follow
+    the host contract, then relaying named arguments avoids shifting values at
+    either boundary.
+    """
+    bound = signature.bind(*args, **kwargs)
+    bound.apply_defaults()
+    parameters = signature.parameters
+    receiver_name = next(iter(parameters), None)
+    owner_args = ()
+    owner_kwargs = {}
+    for name, value in bound.arguments.items():
+        if name == receiver_name:
+            continue
+        parameter = parameters[name]
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            owner_kwargs.update(value)
+        elif parameter.kind is inspect.Parameter.VAR_POSITIONAL:
+            owner_args += tuple(value)
+        else:
+            owner_kwargs[name] = value
+    return owner_args, owner_kwargs
+
+
 def _make_sync_wrapper(original, state, route: str = "search_site_torrents"):
+    host_signature = inspect.signature(original)
+
     @functools.wraps(original)
     def wrapper(*args, **kwargs):
         site = _site_from_call(args, kwargs)
         owner = _owner_for_site(state, site, route)
         if owner is not None:
             try:
+                owner_args, owner_kwargs = _owner_call_arguments(
+                    host_signature, args, kwargs
+                )
                 return _call_owner(
                     owner,
                     _OWNER_METHODS.get(route, ("search_torrents",)),
-                    args[1:],
-                    kwargs,
+                    owner_args,
+                    owner_kwargs,
                 )
             except Exception as error:
                 # A plugin module must not break the host's ordinary search
@@ -513,17 +547,22 @@ def _make_sync_wrapper(original, state, route: str = "search_site_torrents"):
 
 
 def _make_async_wrapper(original, state, route: str = "async_search_site_torrents"):
+    host_signature = inspect.signature(original)
+
     @functools.wraps(original)
     async def wrapper(*args, **kwargs):
         site = _site_from_call(args, kwargs)
         owner = _owner_for_site(state, site, route)
         if owner is not None:
             try:
+                owner_args, owner_kwargs = _owner_call_arguments(
+                    host_signature, args, kwargs
+                )
                 return await _call_owner_async(
                     owner,
                     _OWNER_METHODS.get(route, ("async_search_torrents",)),
-                    args[1:],
-                    kwargs,
+                    owner_args,
+                    owner_kwargs,
                 )
             except Exception as error:
                 if _propagates_upstream_error(route, error):

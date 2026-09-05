@@ -8,7 +8,7 @@ PLUGIN_DIRS = (
     ROOT / "plugins.v3" / "jackettextend",
     ROOT / "plugins.v3" / "prowlarrextend",
 )
-SHARED_MODULES = ("_host_compat.py", "_site_registry.py", "_torznab_core.py")
+SHARED_MODULES = ("_host_compat.py", "_site_registry.py", "_torznab_core.py", "_response.py")
 
 
 class RepositoryContractTest(unittest.TestCase):

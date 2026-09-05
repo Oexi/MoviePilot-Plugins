@@ -59,6 +59,23 @@ class ExplodingOwner(Owner):
         raise RuntimeError("async owner failure")
 
 
+class ExactOwner(Owner):
+    def __init__(self, name="exact"):
+        super().__init__(name)
+        self.bound_sync_calls = []
+        self.bound_async_calls = []
+
+    def search_torrents(self, site, keyword=None, mtype=None, cat=None, page=0):
+        self.bound_sync_calls.append((site, keyword, mtype, cat, page))
+        return [f"{self.name}-sync"]
+
+    async def async_search_torrents(
+        self, site, keyword=None, mtype=None, cat=None, page=0
+    ):
+        self.bound_async_calls.append((site, keyword, mtype, cat, page))
+        return [f"{self.name}-async"]
+
+
 def make_chain():
     calls = []
 
@@ -167,6 +184,127 @@ class HostCompatTest(unittest.TestCase):
         self.assertTrue(COMPAT.status()["installed"])
         self.assertTrue(COMPAT.uninstall(second))
         self.assertFalse(COMPAT.status()["installed"])
+
+    def test_host_arguments_are_named_for_search_and_refresh_fallback(self):
+        host_calls = self.host_calls
+
+        def refresh_torrents(self, site, keyword=None, cat=None, page=0, mtype=None):
+            host_calls.append(("refresh", site, keyword, cat, page, mtype))
+            return ["host-refresh"]
+
+        async def async_refresh_torrents(
+            self, site, keyword=None, cat=None, page=0, mtype=None
+        ):
+            host_calls.append(("async-refresh", site, keyword, cat, page, mtype))
+            return ["host-async-refresh"]
+
+        self.ChainBase.refresh_torrents = refresh_torrents
+        self.ChainBase.async_refresh_torrents = async_refresh_torrents
+        owner = ExactOwner()
+        self.assertTrue(COMPAT.install(owner))
+        chain = self.ChainBase()
+        site = {"domain": "jackett_extend.exact"}
+
+        self.assertEqual(
+            chain.search_site_torrents(site, "positional", "movie", 1),
+            ["exact-sync"],
+        )
+        self.assertEqual(
+            chain.search_site_torrents(site, keyword="mixed", page=2),
+            ["exact-sync"],
+        )
+        self.assertEqual(
+            chain.search_site_torrents(
+                site=site, keyword="keyword", mtype="music", page=3
+            ),
+            ["exact-sync"],
+        )
+        self.assertEqual(
+            owner.bound_sync_calls,
+            [
+                (site, "positional", "movie", None, 1),
+                (site, "mixed", None, None, 2),
+                (site, "keyword", "music", None, 3),
+            ],
+        )
+
+        self.assertEqual(
+            asyncio.run(
+                chain.async_search_site_torrents(site, "async-positional", "tv", 4)
+            ),
+            ["exact-async"],
+        )
+        self.assertEqual(
+            asyncio.run(
+                chain.async_search_site_torrents(site, keyword="async-mixed", page=5)
+            ),
+            ["exact-async"],
+        )
+        self.assertEqual(
+            asyncio.run(
+                chain.async_search_site_torrents(
+                    site=site, keyword="async-keyword", mtype="music", page=6
+                )
+            ),
+            ["exact-async"],
+        )
+        self.assertEqual(
+            owner.bound_async_calls,
+            [
+                (site, "async-positional", "tv", None, 4),
+                (site, "async-mixed", None, None, 5),
+                (site, "async-keyword", "music", None, 6),
+            ],
+        )
+
+        # Exact host refresh order is cat/page/mtype.  ExactOwner has no
+        # refresh method, so both routes deliberately exercise search fallback.
+        self.assertEqual(
+            chain.refresh_torrents(site, "refresh-positional", "3010", 7, "music"),
+            ["exact-sync"],
+        )
+        self.assertEqual(
+            chain.refresh_torrents(
+                site, keyword="refresh-mixed", cat="2010", page=8, mtype="movie"
+            ),
+            ["exact-sync"],
+        )
+        self.assertEqual(
+            chain.refresh_torrents(site=site, cat="5000", mtype="tv"),
+            ["exact-sync"],
+        )
+        self.assertEqual(
+            owner.bound_sync_calls[-3:],
+            [
+                (site, "refresh-positional", "music", "3010", 7),
+                (site, "refresh-mixed", "movie", "2010", 8),
+                (site, None, "tv", "5000", 0),
+            ],
+        )
+
+        self.assertEqual(
+            asyncio.run(
+                chain.async_refresh_torrents(
+                    site, "async-refresh-positional", "5010", 9, "tv"
+                )
+            ),
+            ["exact-async"],
+        )
+        self.assertEqual(
+            asyncio.run(
+                chain.async_refresh_torrents(
+                    site=site, keyword="async-refresh-keyword", cat="3010", mtype="music"
+                )
+            ),
+            ["exact-async"],
+        )
+        self.assertEqual(
+            owner.bound_async_calls[-2:],
+            [
+                (site, "async-refresh-positional", "tv", "5010", 9),
+                (site, "async-refresh-keyword", "music", "3010", 0),
+            ],
+        )
 
     def test_host_capability_attributes_do_not_change_current_boundary(self):
         original = self.ChainBase.search_site_torrents
@@ -391,6 +529,56 @@ class IndexerHelpersTest(unittest.TestCase):
             INDEXERS.apply_indexer_selection(profiles, ["missing"], explicit=True),
             [],
         )
+
+    def test_category_ranges_preserve_subcategories_and_feed_host_music_selector(self):
+        caps = [
+            {"ID": "1999", "Name": "before movies"},
+            {"ID": "2000", "Name": "Movies"},
+            {"ID": "2010", "Name": "Foreign Movies"},
+            {"ID": "2999", "Name": "last movie"},
+            {"ID": "3000", "Name": "Music"},
+            {"ID": "3010", "Name": "Albums"},
+            {"ID": "3999", "Name": "last music"},
+            {"ID": "4000", "Name": "outside music"},
+            {"ID": "4999", "Name": "before tv"},
+            {"ID": "5000", "Name": "TV"},
+            {"ID": "5010", "Name": "Episodes"},
+            {"ID": "5999", "Name": "last tv"},
+            {"ID": "6000", "Name": "after tv"},
+            {"ID": "2000x", "Name": "malformed"},
+            {"ID": "+2010", "Name": "signed"},
+            {"ID": "30.10", "Name": "decimal"},
+            {"ID": True, "Name": "boolean"},
+            {"ID": None, "Name": "missing"},
+        ]
+
+        category = INDEXERS._category_for_caps(caps)
+        self.assertEqual(
+            [entry["id"] for entry in category["movie"]],
+            ["2000", "2010", "2999"],
+        )
+        self.assertEqual(
+            [entry["id"] for entry in category["music"]],
+            ["3000", "3010", "3999"],
+        )
+        self.assertEqual(
+            [entry["id"] for entry in category["tv"]],
+            ["5000", "5010", "5999"],
+        )
+
+        # Mirror the host's category-only music selector locally so this test
+        # does not import the live MoviePilot application/startup graph.
+        def host_supports_music(indexer):
+            categories = indexer.get("category") or {}
+            return isinstance(categories, dict) and bool(categories.get("music"))
+
+        profile = INDEXERS.build_indexer_profiles(
+            [{"id": "music-indexer", "name": "Music", "caps": caps}],
+            "https://jackett.invalid",
+            False,
+        )[0]
+        self.assertTrue(host_supports_music(profile))
+        self.assertFalse(host_supports_music({"category": {"movie": category["movie"]}}))
 
     def test_jackett_type_maps_to_privacy_without_guessing_unknown_values(self):
         raw = [
