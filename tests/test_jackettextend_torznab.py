@@ -1,4 +1,6 @@
 import importlib.util
+import sys
+import types
 import unittest
 import xml.dom.minidom
 import xml.etree.ElementTree as ElementTree
@@ -7,11 +9,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "plugins.v3" / "jackettextend" / "_torznab.py"
+PACKAGE_PATH = MODULE_PATH.parent
 FIXTURES = ROOT / "tests" / "fixtures"
 TORZNAB_NS = "{http://torznab.com/schemas/2015/feed}"
 
-SPEC = importlib.util.spec_from_file_location("jackettextend_torznab", MODULE_PATH)
+PACKAGE_NAME = "jackettextend_torznab_testpkg"
+PACKAGE = types.ModuleType(PACKAGE_NAME)
+PACKAGE.__path__ = [str(PACKAGE_PATH)]
+sys.modules[PACKAGE_NAME] = PACKAGE
+SPEC = importlib.util.spec_from_file_location(f"{PACKAGE_NAME}._torznab", MODULE_PATH)
 MODULE = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 
 

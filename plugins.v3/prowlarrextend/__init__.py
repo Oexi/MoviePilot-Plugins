@@ -25,6 +25,7 @@ from app.sdk.utilities import StringUtils
 from ._torznab import (
     build_torznab_url,
     classify_torznab_response,
+    contains_xml_dtd,
     extract_torznab_item,
     redact_url,
     safe_count,
@@ -46,6 +47,7 @@ from ._indexers import (
     selection_is_explicit,
 )
 from ._ui import build_form, build_page
+from ._site_registry import open_site_registry
 
 class ProwlarrExtend(_PluginBase):
     # 插件名称
@@ -55,7 +57,7 @@ class ProwlarrExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Prowlarr.png"
     # 插件版本
-    plugin_version = "1.0.4"
+    plugin_version = "1.0.5"
     # 插件作者
     plugin_author = "oexi"
     # 作者主页
@@ -272,6 +274,8 @@ class ProwlarrExtend(_PluginBase):
         text = str(value).strip()
         if not text:
             return ""
+        if "://" in text and not text.lower().startswith(("http://", "https://")):
+            return ""
         if not text.lower().startswith(("http://", "https://")):
             text = "http://" + text
         try:
@@ -402,28 +406,24 @@ class ProwlarrExtend(_PluginBase):
             # on that single observation.
             if not sync_ready or not isinstance(indexers_snapshot, list) or not indexers_snapshot:
                 return True
-            from app.db.oper.site import SiteOper
-            from app.schemas.types import EventType
-            from app.sdk.events import eventmanager
-
             current_domains = {
                 str(i.get("domain", "")).lower()
                 for i in indexers_snapshot
                 if isinstance(i, dict) and i.get("domain")
             }
-            site_oper = SiteOper()
+            site_registry = open_site_registry()
             stage_ok = True
-            for site in site_oper.list():
+            for site in site_registry.list():
                 if not self._sync_is_current(generation):
                     return False
                 site_domain = str(getattr(site, "domain", "") or "").strip().lower()
                 if (self._indexer_id_from_domain(site_domain)
                         and site_domain not in current_domains):
-                    site_oper.delete(site.id)
+                    site_registry.delete(site.id)
                     logger.info(f"【{self.plugin_name}】已清理过期站点记录: {site_domain}")
                     # A2: 删除后发送 SiteDeleted 事件,触发宿主清理搜索开关/缓存
                     try:
-                        eventmanager.send_event(EventType.SiteDeleted, {"site_id": site.id})
+                        site_registry.notify_deleted(site.id)
                     except Exception as e:
                         stage_ok = False
                         logger.warning(f"【{self.plugin_name}】发送 SiteDeleted 事件失败：{type(e).__name__}")
@@ -634,19 +634,15 @@ class ProwlarrExtend(_PluginBase):
         """Remove only persisted sites in ProwlarrExtend's reserved namespace."""
         with self._sync_lock:
             try:
-                from app.db.oper.site import SiteOper
-                from app.schemas.types import EventType
-                from app.sdk.events import eventmanager
-
-                site_oper = SiteOper()
+                site_registry = open_site_registry()
                 removed = 0
                 failed = 0
-                for site in site_oper.list():
+                for site in site_registry.list():
                     site_domain = str(getattr(site, "domain", "") or "").strip().lower()
                     if not self._indexer_id_from_domain(site_domain):
                         continue
                     try:
-                        site_oper.delete(site.id)
+                        site_registry.delete(site.id)
                     except Exception as error:  # noqa: BLE001 - isolate rows
                         failed += 1
                         logger.warning(
@@ -655,10 +651,7 @@ class ProwlarrExtend(_PluginBase):
                         continue
                     removed += 1
                     try:
-                        eventmanager.send_event(
-                            EventType.SiteDeleted,
-                            {"site_id": site.id},
-                        )
+                        site_registry.notify_deleted(site.id)
                     except Exception as error:  # noqa: BLE001 - DB delete succeeded
                         failed += 1
                         logger.warning(
@@ -714,12 +707,8 @@ class ProwlarrExtend(_PluginBase):
         if not domain:
             return False
         try:
-            from app.db.oper.site import SiteOper
-            from app.schemas.types import EventType
-            from app.sdk.events import eventmanager
-
-            site_oper = SiteOper()
-            exists = site_oper.get_by_domain(domain)
+            site_registry = open_site_registry()
+            exists = site_registry.get_by_domain(domain)
             name = indexer.get("name", "")
             # 站点地址必须与插件"查看数据"给出的格式一致(https://prowlarr_extend.xxx/),
             # 官方 add_site 同样校正为 {scheme}://{netloc}/;torznab API 地址会导致校验失败
@@ -730,7 +719,7 @@ class ProwlarrExtend(_PluginBase):
             if exists:
                 # B1: 更新分支只同步 name/url/public 来源字段,
                 # 保留 is_active/pri/proxy 等用户站点设置不被 cron 覆盖
-                site_oper.update(exists.id, {"name": name, "url": url, "public": public})
+                site_registry.update(exists.id, {"name": name, "url": url, "public": public})
                 logger.info(f"【{self.plugin_name}】已更新站点记录: {domain}")
             else:
                 # 新增才写入默认启停/优先级/代理
@@ -744,18 +733,18 @@ class ProwlarrExtend(_PluginBase):
                     "pri": 1,
                 }
                 try:
-                    site_oper.add(**payload)
+                    site_registry.add(**payload)
                     logger.info(f"【{self.plugin_name}】已注册站点到 DB: {domain}")
                 except Exception as e:
                     # B2: 并发下重复插入等冲突,重新查询,已存在则转更新分支
-                    existing = site_oper.get_by_domain(domain)
+                    existing = site_registry.get_by_domain(domain)
                     if not existing:
                         raise
-                    site_oper.update(existing.id, {"name": name, "url": url, "public": public})
+                    site_registry.update(existing.id, {"name": name, "url": url, "public": public})
                     logger.debug(f"【{self.plugin_name}】站点已存在(并发注册),转为更新: {domain}, {type(e).__name__}")
             # 通知宿主刷新站点缓存
             try:
-                eventmanager.send_event(EventType.SiteUpdated, {"domain": domain})
+                site_registry.notify_updated(domain)
             except Exception as e:
                 logger.warning(f"【{self.plugin_name}】发送 SiteUpdated 事件失败：{type(e).__name__}")
                 return False
@@ -1414,15 +1403,12 @@ class ProwlarrExtend(_PluginBase):
         if isinstance(body, bytes):
             body_empty = not body.strip()
             body_size = len(body)
-            doctype_match = re.search(rb"<!DOCTYPE\b", body, flags=re.IGNORECASE)
         elif isinstance(body, str):
             body_empty = not body.strip()
             body_size = len(body.encode("utf-8", errors="ignore"))
-            doctype_match = re.search(r"<!DOCTYPE\b", body, flags=re.IGNORECASE)
         else:
             body_empty = True
             body_size = 0
-            doctype_match = None
         if body_empty:
             self._record_error("empty", source="search")
             logger.debug(f"【{self.plugin_name}】torznab 空响应：url={log_url}")
@@ -1434,7 +1420,13 @@ class ProwlarrExtend(_PluginBase):
             self._record_error("xml_too_large", source="search")
             logger.warning(f"【{self.plugin_name}】torznab XML 超出大小限制：url={log_url}")
             return upstream_failure("invalid_response")
-        if doctype_match:
+        try:
+            contains_dtd = contains_xml_dtd(body)
+        except (LookupError, UnicodeError) as e:
+            self._record_error("xml_error", source="search")
+            logger.warning(f"【{self.plugin_name}】torznab XML 编码扫描失败：url={log_url}, 类型={type(e).__name__}")
+            return upstream_failure("torznab_error")
+        if contains_dtd:
             self._record_error("xml_doctype", source="search")
             logger.warning(f"【{self.plugin_name}】torznab XML 含不支持的 DOCTYPE：url={log_url}")
             return upstream_failure("invalid_response")

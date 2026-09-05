@@ -1,5 +1,7 @@
 import copy
 import importlib.util
+import sys
+import types
 import unittest
 import xml.dom.minidom
 from pathlib import Path
@@ -9,11 +11,16 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / "plugins.v3" / "prowlarrextend"
 FIXTURES = ROOT / "tests" / "fixtures"
+PACKAGE_NAME = "prowlarrextend_helpers_testpkg"
+PACKAGE_MODULE = types.ModuleType(PACKAGE_NAME)
+PACKAGE_MODULE.__path__ = [str(PACKAGE)]
+sys.modules[PACKAGE_NAME] = PACKAGE_MODULE
 
 
 def load_helper(filename, name):
-    spec = importlib.util.spec_from_file_location(name, PACKAGE / filename)
+    spec = importlib.util.spec_from_file_location(f"{PACKAGE_NAME}.{name}", PACKAGE / filename)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -164,8 +171,6 @@ class ProwlarrUiHelperTest(unittest.TestCase):
     def test_form_has_current_configuration_only_and_prewires_port(self):
         # Relative import requires a tiny package shim, while still avoiding
         # any MoviePilot module installation.
-        import sys
-        import types
         package = types.ModuleType("prowlarrextend_ui_pkg")
         package.__path__ = [str(PACKAGE)]
         sys.modules[package.__name__] = package

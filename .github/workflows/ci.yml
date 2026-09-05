@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependency
+        run: python3 -m pip install --disable-pip-version-check requests
+      - name: Run unittest suite
+        run: python3 -m unittest discover -s tests -v
+      - name: Validate package manifest
+        run: python3 -m json.tool package.v3.json
+      - name: Check patch whitespace
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          AFTER_SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          zero_sha=0000000000000000000000000000000000000000
+
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            base_sha="$BASE_SHA"
+            head_sha="$HEAD_SHA"
+          else
+            base_sha="$BEFORE_SHA"
+            head_sha="$AFTER_SHA"
+          fi
+
+          if [ "$base_sha" = "$zero_sha" ]; then
+            if git rev-parse --verify "$head_sha^" >/dev/null 2>&1; then
+              base_sha="$(git rev-parse "$head_sha^")"
+            else
+              git diff --check --root "$head_sha"
+              exit 0
+            fi
+          fi
+
+          git diff --check "$base_sha" "$head_sha"
+      - name: Check canonical shared module mirrors
+        run: python3 tools/sync_shared_modules.py --check

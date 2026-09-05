@@ -217,6 +217,31 @@ class HostCompatTest(unittest.TestCase):
         self.assertEqual(len(owner.sync_calls), 1)
         self.assertEqual(len(owner.async_calls), 1)
 
+    def test_owner_errors_emit_rate_limited_sanitized_diagnostic(self):
+        owner = ExplodingOwner()
+        messages = []
+        original_emitter = COMPAT._emit_bridge_warning
+        COMPAT._emit_bridge_warning = messages.append
+        try:
+            self.assertTrue(COMPAT.install(owner))
+            chain = self.ChainBase()
+            site = {"domain": "jackett_extend.private-site"}
+
+            self.assertEqual(chain.search_site_torrents(site, "private-title"), ["host-sync"])
+            self.assertEqual(chain.search_site_torrents(site, "private-title"), ["host-sync"])
+
+            self.assertEqual(len(messages), 1)
+            message = messages[0]
+            self.assertIn("bridge_dispatch_error", message)
+            self.assertIn("route=search_site_torrents", message)
+            self.assertIn("phase=dispatch", message)
+            self.assertIn("error_type=RuntimeError", message)
+            self.assertNotIn("private-title", message)
+            self.assertNotIn("private-site", message)
+            self.assertNotIn("sync owner failure", message)
+        finally:
+            COMPAT._emit_bridge_warning = original_emitter
+
     def test_generation_race_never_calls_the_stale_owner(self):
         first = Owner("first")
         second = Owner("second")

@@ -1,4 +1,5 @@
 import asyncio
+import codecs
 import copy
 import importlib.util
 import inspect
@@ -10,6 +11,8 @@ import unittest
 import xml.dom.minidom
 from contextlib import contextmanager
 from pathlib import Path
+
+import requests
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -64,6 +67,16 @@ class _Response:
     status_code = 200
     headers = {"Content-Type": "application/xml"}
     text = ""
+
+
+def _real_xml_response(content):
+    """Build a real requests.Response around an exact wire payload."""
+    response = requests.Response()
+    response.status_code = 200
+    response.headers = {"Content-Type": "application/xml"}
+    response._content = content
+    response._content_consumed = True
+    return response
 
 
 class _RequestUtils:
@@ -255,6 +268,31 @@ class JackettV3ContractTest(unittest.TestCase):
 
         walk(page)
         return values
+
+    def test_metadata_uses_lowercase_author(self):
+        manifest = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["JackettExtend"]["author"], "oexi")
+        with loaded_module() as module:
+            self.assertEqual(module.JackettExtend.plugin_author, "oexi")
+
+    def test_host_normalization_matches_safe_http_base_contract(self):
+        with loaded_module() as module:
+            normalize = module.JackettExtend._normalize_host
+            cases = {
+                None: "",
+                "": "",
+                " jackett:9117 ": "http://jackett:9117",
+                "HTTP://jackett:9117/": "http://jackett:9117",
+                "https://jackett:9117/base/path///": "https://jackett:9117/base/path",
+                "ftp://jackett:9117": "",
+                "http://user:pass@jackett:9117": "",
+                "http://jackett:abc": "",
+                "http://jackett:9117?foo=bar": "",
+                "http://jackett:9117/#fragment": "",
+            }
+            for raw, expected in cases.items():
+                with self.subTest(raw=raw):
+                    self.assertEqual(normalize(raw), expected)
 
     def test_async_module_uses_current_to_thread_provider(self):
         with loaded_module() as module:
@@ -556,6 +594,146 @@ class JackettV3ContractTest(unittest.TestCase):
             self.assertIn("foo.bar%2Fbaz", result[0]["url"])
             self.assertIn("foo.bar%2Fbaz", result[0]["domain"])
 
+    def test_fetch_indexers_classifies_transport_errors_and_preserves_empty(self):
+        with loaded_module() as module:
+            plugin = object.__new__(module.JackettExtend)
+            snapshot = {
+                "host": "https://jackett.invalid",
+                "api_key": "secret-key",
+                "password": "",
+                "proxy": False,
+                "timeout": 30,
+            }
+            logs = []
+            module.logger = types.SimpleNamespace(
+                warning=lambda message: logs.append(str(message)),
+                error=lambda message: logs.append(str(message)),
+                debug=lambda message: logs.append(str(message)),
+                info=lambda message: logs.append(str(message)),
+            )
+
+            class Response:
+                status_code = 200
+                headers = {"Content-Type": "application/json"}
+
+                @staticmethod
+                def json():
+                    return [{"id": "nyaa", "name": "Nyaa", "type": "public", "caps": []}]
+
+            class Request:
+                mode = "normal"
+                response = Response()
+                calls = []
+
+                def __init__(self, *args, **kwargs):
+                    self.calls.append(("init", kwargs))
+
+                def get_res(self, url, **kwargs):
+                    self.calls.append(("get", url, kwargs))
+                    if self.mode == "timeout":
+                        raise requests.Timeout("https://jackett.invalid/?apikey=secret-key&q=private-title")
+                    if self.mode == "request_error":
+                        raise requests.RequestException(
+                            "https://jackett.invalid/?apikey=secret-key&q=private-title"
+                        )
+                    return self.response
+
+            module.RequestUtils = Request
+            cases = (
+                ("timeout", "timeout", None),
+                ("request_error", "request_error", None),
+                ("empty", "empty", None),
+                ("normal", None, ["nyaa"]),
+            )
+            for mode, expected_error, expected_indexers in cases:
+                with self.subTest(mode=mode):
+                    Request.mode = mode
+                    Request.response = None if mode == "empty" else Response()
+                    Request.calls.clear()
+                    plugin._last_error = None
+                    result = plugin._JackettExtend__fetch_indexers(snapshot)
+
+                    if expected_indexers is None:
+                        self.assertIsNone(result)
+                    else:
+                        self.assertEqual(
+                            [indexer["indexer_id"] for indexer in result],
+                            expected_indexers,
+                        )
+                    self.assertEqual(plugin._last_error, expected_error)
+                    self.assertTrue(Request.calls[-1][2]["raise_exception"])
+
+            rendered_logs = " ".join(logs)
+            self.assertNotIn("secret-key", rendered_logs)
+            self.assertNotIn("private-title", rendered_logs)
+
+    def test_parse_torznab_classifies_transport_errors_and_preserves_empty(self):
+        with loaded_module() as module:
+            plugin = object.__new__(module.JackettExtend)
+            plugin._timeout = 12
+            plugin._proxy = False
+            plugin._state_lock = module.JackettExtend._state_lock
+            url = "https://jackett.invalid/results?apikey=secret-key&q=private-title"
+            logs = []
+            module.logger = types.SimpleNamespace(
+                warning=lambda message: logs.append(str(message)),
+                error=lambda message: logs.append(str(message)),
+                debug=lambda message: logs.append(str(message)),
+                info=lambda message: logs.append(str(message)),
+            )
+
+            class Response:
+                status_code = 200
+                headers = {"Content-Type": "application/xml"}
+                text = (
+                    "<rss><channel>"
+                    "<item><title>Release</title>"
+                    "<enclosure url='https://site/release.torrent'/></item>"
+                    "</channel></rss>"
+                )
+
+            class Request:
+                mode = "normal"
+                response = Response()
+                calls = []
+
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                def get_res(self, url, **kwargs):
+                    self.calls.append((url, kwargs))
+                    if self.mode == "timeout":
+                        raise requests.Timeout("https://jackett.invalid/?apikey=secret-key&q=private-title")
+                    if self.mode == "request_error":
+                        raise requests.RequestException(
+                            "https://jackett.invalid/?apikey=secret-key&q=private-title"
+                        )
+                    return self.response
+
+            module.RequestUtils = Request
+            cases = (
+                ("timeout", "timeout", 0),
+                ("request_error", "request_error", 0),
+                ("empty", "empty", 0),
+                ("normal", None, 1),
+            )
+            for mode, expected_error, expected_count in cases:
+                with self.subTest(mode=mode):
+                    Request.mode = mode
+                    Request.response = None if mode == "empty" else Response()
+                    Request.calls.clear()
+                    plugin._last_search_error = None
+                    plugin._last_search_error_at = 0.0
+                    result = plugin._JackettExtend__parse_torznab_xml(url)
+
+                    self.assertEqual(len(result), expected_count)
+                    self.assertEqual(plugin._last_search_error, expected_error)
+                    self.assertTrue(Request.calls[-1][1]["raise_exception"])
+
+            rendered_logs = " ".join(logs)
+            self.assertNotIn("secret-key", rendered_logs)
+            self.assertNotIn("private-title", rendered_logs)
+
     def test_finite_all_stale_whitelist_never_becomes_all(self):
         with loaded_module() as module:
             plugin = object.__new__(module.JackettExtend)
@@ -824,6 +1002,188 @@ class JackettV3ContractTest(unittest.TestCase):
             self.assertEqual(result[0].category, "音乐")
             self.assertEqual(_RequestUtils.timeouts[-1], 12)
 
+    def test_parser_prefers_raw_content_when_text_guess_conflicts_with_xml_encoding(self):
+        with loaded_module() as module:
+            title = "Café release"
+            xml = (
+                '<?xml version="1.0" encoding="ISO-8859-1"?>'
+                "<rss><channel><item>"
+                f"<title>{title}</title>"
+                "<enclosure url='https://site/latin1.torrent'/>"
+                "</item></channel></rss>"
+            )
+            response = _Response()
+            response.content = xml.encode("iso-8859-1")
+            # Simulate an HTTP charset guess that decoded the wire bytes as
+            # UTF-8 before the parser received the response.
+            response.text = response.content.decode("utf-8", errors="replace")
+            _RequestUtils.response = response
+            plugin = object.__new__(module.JackettExtend)
+            plugin._timeout = 12
+            plugin._proxy = False
+            plugin._last_error = None
+            plugin._state_lock = module.JackettExtend._state_lock
+
+            result = plugin._JackettExtend__parse_torznab_xml(
+                "https://jackett.invalid/results",
+                site={"name": "Nyaa"},
+            )
+
+            self.assertEqual(len(result), 1)
+            self.assertEqual(result[0].title, title)
+
+    def test_parser_falls_back_to_text_when_response_has_no_content(self):
+        with loaded_module() as module:
+            response = _Response()
+            response.text = (
+                '<?xml version="1.0" encoding="UTF-8"?><rss><channel>'
+                "<item><title>Text fallback</title>"
+                "<enclosure url='https://site/text-fallback.torrent'/>"
+                "</item></channel></rss>"
+            )
+            self.assertFalse(hasattr(response, "content"))
+            _RequestUtils.response = response
+            plugin = object.__new__(module.JackettExtend)
+            plugin._timeout = 12
+            plugin._proxy = False
+            plugin._last_error = None
+            plugin._state_lock = module.JackettExtend._state_lock
+
+            result = plugin._JackettExtend__parse_torznab_xml(
+                "https://jackett.invalid/results",
+                site={"name": "Nyaa"},
+            )
+
+            self.assertEqual(len(result), 1)
+            self.assertEqual(result[0].title, "Text fallback")
+
+    def test_parser_accepts_normal_utf8_raw_content(self):
+        with loaded_module() as module:
+            xml = (
+                '<?xml version="1.0" encoding="UTF-8"?><rss><channel>'
+                "<item><title>正常 UTF-8</title>"
+                "<enclosure url='https://site/utf8.torrent'/>"
+                "</item></channel></rss>"
+            )
+            response = _Response()
+            response.content = xml.encode("utf-8")
+            response.text = ""
+            _RequestUtils.response = response
+            plugin = object.__new__(module.JackettExtend)
+            plugin._timeout = 12
+            plugin._proxy = False
+            plugin._last_error = None
+            plugin._state_lock = module.JackettExtend._state_lock
+
+            result = plugin._JackettExtend__parse_torznab_xml(
+                "https://jackett.invalid/results",
+                site={"name": "Nyaa"},
+            )
+
+            self.assertEqual(len(result), 1)
+            self.assertEqual(result[0].title, "正常 UTF-8")
+
+    def test_parser_rejects_dtd_in_all_supported_wire_encodings(self):
+        with loaded_module() as module:
+            plugin = object.__new__(module.JackettExtend)
+            plugin._timeout = 12
+            plugin._proxy = False
+            plugin._last_error = None
+            plugin._state_lock = module.JackettExtend._state_lock
+
+            class Request:
+                response = None
+
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                def get_res(self, *_args, **_kwargs):
+                    return self.response
+
+            module.RequestUtils = Request
+            encodings = (
+                ("utf-8", "UTF-8", codecs.BOM_UTF8),
+                ("utf-16-le", "UTF-16", codecs.BOM_UTF16_LE),
+                ("utf-16-be", "UTF-16", codecs.BOM_UTF16_BE),
+                ("utf-32-le", "UTF-32", codecs.BOM_UTF32_LE),
+                ("utf-32-be", "UTF-32", codecs.BOM_UTF32_BE),
+            )
+            for encoding, declaration, bom in encodings:
+                for with_declaration in (False, True):
+                    for with_bom in (False, True):
+                        with self.subTest(
+                                encoding=encoding,
+                                with_declaration=with_declaration,
+                                with_bom=with_bom):
+                            xml = (
+                                f'<?xml version="1.0" encoding="{declaration}"?>'
+                                if with_declaration else ""
+                            ) + (
+                                '<!DOCTYPE rss [<!ENTITY x "expanded">]>'
+                                '<rss><channel><item><title>&x;</title>'
+                                '<enclosure url="https://site/release.torrent"/>'
+                                '</item></channel></rss>'
+                            )
+                            content = xml.encode(encoding)
+                            if with_bom:
+                                content = bom + content
+                            response = _real_xml_response(content)
+                            self.assertIsInstance(response, requests.Response)
+                            Request.response = response
+                            plugin._last_search_error = None
+
+                            self.assertEqual(
+                                plugin._JackettExtend__parse_torznab_xml(
+                                    "https://jackett.invalid/results?q=private-title&apikey=secret"
+                                ),
+                                [],
+                            )
+                            self.assertEqual(plugin._last_search_error, "xml_doctype")
+
+    def test_parser_preserves_xml_declaration_encoding_for_real_response(self):
+        with loaded_module() as module:
+            plugin = object.__new__(module.JackettExtend)
+            plugin._timeout = 12
+            plugin._proxy = False
+            plugin._last_error = None
+            plugin._state_lock = module.JackettExtend._state_lock
+
+            class Request:
+                response = None
+
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                def get_res(self, *_args, **_kwargs):
+                    return self.response
+
+            module.RequestUtils = Request
+            cases = (
+                ("utf-8", "UTF-8", "中文标题"),
+                ("utf-16-le", "UTF-16", "日本語タイトル"),
+                ("utf-16-be", "UTF-16", "中文と日本語"),
+                ("iso-8859-1", "ISO-8859-1", "Café release"),
+            )
+            for encoding, declaration, title in cases:
+                with self.subTest(encoding=encoding):
+                    xml = (
+                        f'<?xml version="1.0" encoding="{declaration}"?><rss><channel>'
+                        f'<item><title>{title}</title>'
+                        '<enclosure url="https://site/release.torrent"/>'
+                        '</item></channel></rss>'
+                    )
+                    Request.response = _real_xml_response(xml.encode(encoding))
+                    plugin._last_search_error = None
+
+                    result = plugin._JackettExtend__parse_torznab_xml(
+                        "https://jackett.invalid/results",
+                        site={"name": "Encoding Site"},
+                    )
+
+                    self.assertEqual(len(result), 1)
+                    self.assertEqual(result[0].title, title)
+                    self.assertIsNone(plugin._last_search_error)
+
     def test_parser_normalizes_valid_imdb_identity(self):
         with loaded_module() as module:
             _RequestUtils.response = _Response()
@@ -1064,6 +1424,31 @@ class JackettV3ContractTest(unittest.TestCase):
                     plugin._JackettExtend__parse_torznab_xml("https://jackett.invalid/results?q=x"),
                     [],
                 )
+
+    def test_parser_applies_size_limit_to_raw_content(self):
+        with loaded_module() as module:
+            response = _Response()
+            response.content = (
+                b"<rss><channel>"
+                + b"x" * (module.JackettExtend.TORZNAB_MAX_XML_BYTES + 1)
+                + b"</channel></rss>"
+            )
+            # A smaller text representation must not bypass the wire-size
+            # limit when raw content is available.
+            response.text = "<rss><channel /></rss>"
+            _RequestUtils.response = response
+            plugin = object.__new__(module.JackettExtend)
+            plugin._timeout = 12
+            plugin._proxy = False
+            plugin._last_error = None
+            plugin._state_lock = module.JackettExtend._state_lock
+
+            result = plugin._JackettExtend__parse_torznab_xml(
+                "https://jackett.invalid/results?q=x"
+            )
+
+            self.assertEqual(result, [])
+            self.assertEqual(plugin._last_search_error, "xml_too_large")
 
             plugin.TORZNAB_MAX_ITEMS = 1
             _RequestUtils.response = _Response()

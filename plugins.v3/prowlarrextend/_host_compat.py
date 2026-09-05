@@ -17,9 +17,11 @@ remain host-owned.
 import functools
 import importlib
 import inspect
+import logging
 import re
 import sys
 import threading
+import time
 import types
 import weakref
 from collections.abc import Mapping
@@ -94,6 +96,7 @@ _MISSING = object()
 # ProwlarrExtend (and vice versa) without relying on ``isinstance``.
 _UPSTREAM_ERROR_ATTR = "__moviepilot_virtual_site_upstream_error__"
 _UPSTREAM_ERROR_MARKER = "sanitized-upstream-error-v1"
+_DIAGNOSTIC_INTERVAL_SECONDS = 300.0
 
 
 class SanitizedUpstreamError(RuntimeError):
@@ -126,6 +129,85 @@ def _is_sanitized_upstream_error(error: BaseException) -> bool:
 
 def _propagates_upstream_error(route: str, error: BaseException) -> bool:
     return route in _OPTIONAL_METHODS and _is_sanitized_upstream_error(error)
+
+
+def _diagnostic_owner_key(owner: object) -> str:
+    """Return a bounded internal owner label without reading user data."""
+    try:
+        value = getattr(owner, "_bridge_owner_key", None)
+    except Exception:
+        value = None
+    if value is None:
+        return "default"
+    text = str(value).strip()
+    if not text:
+        return "default"
+    return re.sub(r"[^A-Za-z0-9_.:-]", "?", text)[:64]
+
+
+def _emit_bridge_warning(message: str) -> None:
+    """Emit one diagnostic without making logging a bridge dependency."""
+    try:
+        module = importlib.import_module("app.sdk.logging")
+        host_logger = getattr(module, "logger", None)
+        warning = getattr(host_logger, "warning", None)
+        if callable(warning):
+            warning(message)
+            return
+    except Exception:
+        pass
+    try:
+        logging.getLogger(__name__).warning(message)
+    except Exception:
+        pass
+
+
+def _record_bridge_error(
+    state: Mapping,
+    owner: object,
+    route: str,
+    error: BaseException,
+    *,
+    phase: str = "dispatch",
+) -> None:
+    """Rate-limit a sanitized bridge failure while preserving fail-open routing."""
+    try:
+        owner_key = _diagnostic_owner_key(owner)
+        error_type = type(error).__name__[:64] or "Exception"
+        key = (phase, owner_key, str(route), error_type)
+        now = time.monotonic()
+        lock = _state_lock(state)
+        emit = False
+        count = 1
+        with lock:
+            diagnostics = state.get("diagnostics")
+            if not isinstance(diagnostics, dict):
+                diagnostics = {}
+                try:
+                    state["diagnostics"] = diagnostics
+                except (TypeError, AttributeError):
+                    diagnostics = {}
+            record = diagnostics.get(key)
+            if not isinstance(record, dict):
+                record = {"last_emit": 0.0, "suppressed": 0}
+                diagnostics[key] = record
+            last_emit = float(record.get("last_emit", 0.0) or 0.0)
+            if last_emit <= 0.0 or now - last_emit >= _DIAGNOSTIC_INTERVAL_SECONDS:
+                count = int(record.get("suppressed", 0) or 0) + 1
+                record["last_emit"] = now
+                record["suppressed"] = 0
+                emit = True
+            else:
+                record["suppressed"] = int(record.get("suppressed", 0) or 0) + 1
+        if emit:
+            _emit_bridge_warning(
+                "bridge_dispatch_error "
+                f"bridge={_BRIDGE_ID} route={route} owner={owner_key} "
+                f"phase={phase} error_type={error_type} count={count}"
+            )
+    except Exception:
+        # Diagnostics must never alter the host fallback path.
+        pass
 
 
 def _find_chain_base() -> Optional[type]:
@@ -276,7 +358,11 @@ def _call_predicate(predicate: Callable, site: Mapping, domain: str):
     return predicate(site, domain)
 
 
-def _owner_for_site(state: Mapping, site: object) -> Any:
+def _owner_for_site(
+    state: Mapping,
+    site: object,
+    route: str = "search_site_torrents",
+) -> Any:
     """Return a generation-validated owner for one virtual-site decision.
 
     Predicate execution is intentionally outside the lock.  A generation
@@ -341,7 +427,8 @@ def _owner_for_site(state: Mapping, site: object) -> Any:
                 return None
         try:
             owned = bool(_call_predicate(predicate, site, domain))
-        except Exception:
+        except Exception as error:
+            _record_bridge_error(state, owner, route, error, phase="predicate")
             owned = False
         if not owned:
             continue
@@ -403,7 +490,7 @@ def _make_sync_wrapper(original, state, route: str = "search_site_torrents"):
     @functools.wraps(original)
     def wrapper(*args, **kwargs):
         site = _site_from_call(args, kwargs)
-        owner = _owner_for_site(state, site)
+        owner = _owner_for_site(state, site, route)
         if owner is not None:
             try:
                 return _call_owner(
@@ -418,7 +505,7 @@ def _make_sync_wrapper(original, state, route: str = "search_site_torrents"):
                 # through deliberately.
                 if _propagates_upstream_error(route, error):
                     raise
-                pass
+                _record_bridge_error(state, owner, route, error)
         return original(*args, **kwargs)
 
     wrapper.__jackett_extend_wrapper__ = True
@@ -429,7 +516,7 @@ def _make_async_wrapper(original, state, route: str = "async_search_site_torrent
     @functools.wraps(original)
     async def wrapper(*args, **kwargs):
         site = _site_from_call(args, kwargs)
-        owner = _owner_for_site(state, site)
+        owner = _owner_for_site(state, site, route)
         if owner is not None:
             try:
                 return await _call_owner_async(
@@ -441,7 +528,7 @@ def _make_async_wrapper(original, state, route: str = "async_search_site_torrent
             except Exception as error:
                 if _propagates_upstream_error(route, error):
                     raise
-                pass
+                _record_bridge_error(state, owner, route, error)
         result = original(*args, **kwargs)
         if inspect.isawaitable(result):
             return await result
@@ -755,6 +842,7 @@ def _new_state(
         "originals": {},
         "defined_here": {},
         "wrappers": {},
+        "diagnostics": {},
     }
     lock = state["lock"]
     with lock:

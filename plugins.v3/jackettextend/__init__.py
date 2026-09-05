@@ -8,7 +8,7 @@ import time
 import unicodedata
 import xml.dom.minidom
 from typing import List, Dict, Any, Tuple, Optional
-from urllib.parse import urlencode, quote, quote_plus, urlsplit
+from urllib.parse import urlencode, quote, quote_plus, urlsplit, urlunsplit
 
 import requests
 from apscheduler.triggers.cron import CronTrigger
@@ -24,6 +24,7 @@ from app.sdk.utilities import StringUtils
 
 from ._torznab import (
     classify_torznab_response,
+    contains_xml_dtd,
     extract_torznab_item,
     redact_url,
     safe_count,
@@ -44,6 +45,7 @@ from ._indexers import (
     selection_is_explicit,
 )
 from ._ui import build_form, build_page
+from ._site_registry import open_site_registry
 
 class JackettExtend(_PluginBase):
     # 插件名称
@@ -53,7 +55,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.2.17"
+    plugin_version = "3.2.18"
     # 插件作者
     plugin_author = "oexi"
     # 作者主页
@@ -99,8 +101,6 @@ class JackettExtend(_PluginBase):
     _last_search_error = None
     _last_search_error_at = 0.0
     sites_helper = None
-    # 仅用于标识，避免重复注册
-    jackett_domain = "jackett_extend.jtcymc"
 
     # E1: 索引器列表 TTL 缓存(内存 + 时间戳)
     _indexers_cache = None
@@ -173,14 +173,10 @@ class JackettExtend(_PluginBase):
         # search/form request cannot observe a partially applied replacement.
         with self._state_lock:
             if isinstance(config, dict) and config:
-                # A7: host 去除首尾空白，协议判断大小写不敏感，None 统一兜底为空串
-                host = config.get("host")
-                if host:
-                    host = str(host).strip()
-                    if not host.lower().startswith(("http://", "https://")):
-                        host = "http://" + host
-                    host = host.rstrip("/")
-                self._host = host or ""
+                # A7: normalize the Jackett base URL before publishing it.
+                # Reject userinfo/query/fragment up front so credentials or
+                # stray query data can never bleed into later API URLs.
+                self._host = self._normalize_host(config.get("host"))
                 self._api_key = str(config.get("api_key") or "").strip()
                 self._password = str(config.get("password") or "")
                 self._enabled = bool(config.get("enabled"))
@@ -258,6 +254,35 @@ class JackettExtend(_PluginBase):
             return cls.SEARCH_TIMEOUT_DEFAULT
         return max(cls.SEARCH_TIMEOUT_MIN, min(cls.SEARCH_TIMEOUT_MAX, timeout))
 
+    @staticmethod
+    def _normalize_host(value: object) -> str:
+        """Return an HTTP(S) Jackett host/base path safe for URL composition."""
+        if value is None:
+            return ""
+        text = str(value).strip()
+        if not text:
+            return ""
+        if "://" in text and not text.lower().startswith(("http://", "https://")):
+            return ""
+        if not text.lower().startswith(("http://", "https://")):
+            text = "http://" + text
+        try:
+            parsed = urlsplit(text)
+            if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
+                return ""
+            if parsed.username is not None or parsed.password is not None:
+                return ""
+            try:
+                _ = parsed.port
+            except ValueError:
+                return ""
+            if parsed.query or parsed.fragment:
+                return ""
+            path = parsed.path.rstrip("/")
+            return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+        except (TypeError, ValueError):
+            return ""
+
     def _capture_config_snapshot_locked(self) -> dict:
         """Capture only immutable network settings used by a sync request.
 
@@ -266,7 +291,7 @@ class JackettExtend(_PluginBase):
         timeout halfway through its request sequence.
         """
         return {
-            "host": str(getattr(self, "_host", "") or ""),
+            "host": self._normalize_host(getattr(self, "_host", "")),
             "api_key": str(getattr(self, "_api_key", "") or ""),
             "password": str(getattr(self, "_password", "") or ""),
             "proxy": bool(getattr(self, "_proxy", False)),
@@ -368,28 +393,24 @@ class JackettExtend(_PluginBase):
             # on that single observation.
             if not sync_ready or not isinstance(indexers_snapshot, list) or not indexers_snapshot:
                 return True
-            from app.db.oper.site import SiteOper
-            from app.schemas.types import EventType
-            from app.sdk.events import eventmanager
-
             current_domains = {
                 str(i.get("domain", "")).lower()
                 for i in indexers_snapshot
                 if isinstance(i, dict) and i.get("domain")
             }
-            site_oper = SiteOper()
+            site_registry = open_site_registry()
             stage_ok = True
-            for site in site_oper.list():
+            for site in site_registry.list():
                 if not self._sync_is_current(generation):
                     return False
                 site_domain = str(getattr(site, "domain", "") or "").strip().lower()
                 if (self._indexer_id_from_domain(site_domain)
                         and site_domain not in current_domains):
-                    site_oper.delete(site.id)
+                    site_registry.delete(site.id)
                     logger.info(f"【{self.plugin_name}】已清理过期站点记录: {site_domain}")
                     # A2: 删除后发送 SiteDeleted 事件,触发宿主清理搜索开关/缓存
                     try:
-                        eventmanager.send_event(EventType.SiteDeleted, {"site_id": site.id})
+                        site_registry.notify_deleted(site.id)
                     except Exception as e:
                         stage_ok = False
                         logger.warning(f"【{self.plugin_name}】发送 SiteDeleted 事件失败：{type(e).__name__}：{str(e)}")
@@ -600,19 +621,15 @@ class JackettExtend(_PluginBase):
         """Remove only persisted sites in JackettExtend's reserved namespace."""
         with self._sync_lock:
             try:
-                from app.db.oper.site import SiteOper
-                from app.schemas.types import EventType
-                from app.sdk.events import eventmanager
-
-                site_oper = SiteOper()
+                site_registry = open_site_registry()
                 removed = 0
                 failed = 0
-                for site in site_oper.list():
+                for site in site_registry.list():
                     site_domain = str(getattr(site, "domain", "") or "").strip().lower()
                     if not self._indexer_id_from_domain(site_domain):
                         continue
                     try:
-                        site_oper.delete(site.id)
+                        site_registry.delete(site.id)
                     except Exception as error:  # noqa: BLE001 - isolate rows
                         failed += 1
                         logger.warning(
@@ -621,10 +638,7 @@ class JackettExtend(_PluginBase):
                         continue
                     removed += 1
                     try:
-                        eventmanager.send_event(
-                            EventType.SiteDeleted,
-                            {"site_id": site.id},
-                        )
+                        site_registry.notify_deleted(site.id)
                     except Exception as error:  # noqa: BLE001 - DB delete succeeded
                         failed += 1
                         logger.warning(
@@ -681,12 +695,8 @@ class JackettExtend(_PluginBase):
         if not domain:
             return False
         try:
-            from app.db.oper.site import SiteOper
-            from app.schemas.types import EventType
-            from app.sdk.events import eventmanager
-
-            site_oper = SiteOper()
-            exists = site_oper.get_by_domain(domain)
+            site_registry = open_site_registry()
+            exists = site_registry.get_by_domain(domain)
             name = indexer.get("name", "")
             # 站点地址必须与插件"查看数据"给出的格式一致(https://jackett_extend.xxx/),
             # 官方 add_site 同样校正为 {scheme}://{netloc}/;torznab API 地址会导致校验失败
@@ -697,7 +707,7 @@ class JackettExtend(_PluginBase):
             if exists:
                 # B1: 更新分支只同步 name/url/public 来源字段,
                 # 保留 is_active/pri/proxy 等用户站点设置不被 cron 覆盖
-                site_oper.update(exists.id, {"name": name, "url": url, "public": public})
+                site_registry.update(exists.id, {"name": name, "url": url, "public": public})
                 logger.info(f"【{self.plugin_name}】已更新站点记录: {domain}")
             else:
                 # 新增才写入默认启停/优先级/代理
@@ -711,18 +721,18 @@ class JackettExtend(_PluginBase):
                     "pri": 1,
                 }
                 try:
-                    site_oper.add(**payload)
+                    site_registry.add(**payload)
                     logger.info(f"【{self.plugin_name}】已注册站点到 DB: {domain}")
                 except Exception as e:
                     # B2: 并发下重复插入等冲突,重新查询,已存在则转更新分支
-                    existing = site_oper.get_by_domain(domain)
+                    existing = site_registry.get_by_domain(domain)
                     if not existing:
                         raise
-                    site_oper.update(existing.id, {"name": name, "url": url, "public": public})
+                    site_registry.update(existing.id, {"name": name, "url": url, "public": public})
                     logger.debug(f"【{self.plugin_name}】站点已存在(并发注册),转为更新: {domain}, {type(e).__name__}: {str(e)}")
             # 通知宿主刷新站点缓存
             try:
-                eventmanager.send_event(EventType.SiteUpdated, {"domain": domain})
+                site_registry.notify_updated(domain)
             except Exception as e:
                 logger.warning(f"【{self.plugin_name}】发送 SiteUpdated 事件失败：{type(e).__name__}：{str(e)}")
                 return False
@@ -1029,7 +1039,7 @@ class JackettExtend(_PluginBase):
                 self._record_error(category, generation=generation)
 
         snapshot = dict(config_snapshot or self._config_for_sync())
-        host = str(snapshot.get("host") or "").rstrip("/")
+        host = self._normalize_host(snapshot.get("host"))
         api_key = str(snapshot.get("api_key") or "")
         password = str(snapshot.get("password") or "")
         proxy = bool(snapshot.get("proxy"))
@@ -1068,7 +1078,8 @@ class JackettExtend(_PluginBase):
             indexer_query_url = f"{host}/api/v2.0/indexers?configured=true"
             ret = RequestUtils(headers=headers, cookies=cookie, timeout=timeout).get_res(
                 indexer_query_url,
-                proxies=settings.PROXY if proxy else None
+                proxies=settings.PROXY if proxy else None,
+                raise_exception=True,
             )
 
             # E3: 校验状态码/Content-Type/数据类型,json 只解析一次
@@ -1097,6 +1108,10 @@ class JackettExtend(_PluginBase):
                     f"【{self.plugin_name}】拉取 indexers 响应类型异常"
                     f"(期望 list,实际 {type(raw_indexers).__name__})")
                 return None
+        except (requests.Timeout, TimeoutError):
+            record_fetch_error("timeout")
+            logger.warning(f"【{self.plugin_name}】获取 Jackett indexers 超时")
+            return None
         except Exception as e:
             record_fetch_error("request_error")
             logger.error(f"【{self.plugin_name}】获取 Jackett indexers 失败：{type(e).__name__}")
@@ -1277,7 +1292,9 @@ class JackettExtend(_PluginBase):
         request_proxy = bool(request_config.get("proxy", getattr(self, "_proxy", False)))
         try:
             ret = RequestUtils(timeout=request_timeout).get_res(
-                url, proxies=settings.PROXY if request_proxy else None
+                url,
+                proxies=settings.PROXY if request_proxy else None,
+                raise_exception=True,
             )
         except (requests.Timeout, TimeoutError):
             self._record_error("timeout", source="search")
@@ -1294,33 +1311,69 @@ class JackettExtend(_PluginBase):
             return []
 
         # F1: 校验状态码与 Content-Type;JSON 错误体不进 XML 解析
-        content_type = (ret.headers.get("Content-Type") or "").lower()
-        response_category = classify_torznab_response(ret.status_code, content_type, ret.text)
+        response_headers = getattr(ret, "headers", {}) or {}
+        content_type = (response_headers.get("Content-Type") or "").lower()
+        # ``requests.Response.content`` is the original wire representation;
+        # keep it as bytes so an XML declaration controls decoding.  Some
+        # lightweight response doubles omit ``content`` or expose a different
+        # type, so those cases retain the historical ``text`` fallback.
+        raw_content = getattr(ret, "content", None)
+        if isinstance(raw_content, (bytes, bytearray, memoryview)):
+            body = bytes(raw_content)
+        else:
+            body = getattr(ret, "text", "")
+        status_code = getattr(ret, "status_code", 0)
+        if isinstance(body, bytes):
+            body_empty = not body or body.isspace()
+            # The Jackett helper predates raw-byte response support and only
+            # needs a non-empty string for its status/content-type checks.
+            # Do not decode the XML merely to classify it.
+            classification_body = "" if body_empty else "raw-bytes"
+        elif isinstance(body, str):
+            body_empty = not body.strip()
+            classification_body = body
+        else:
+            body_empty = True
+            classification_body = ""
+        response_category = classify_torznab_response(
+            status_code, content_type, classification_body
+        )
         if response_category != "ok":
             if response_category == "http_error":
-                self._record_error(f"http_{ret.status_code}", source="search")
+                self._record_error(f"http_{status_code}", source="search")
             else:
                 self._record_error(response_category, source="search")
             logger.warning(
                 f"【{self.plugin_name}】Jackett torznab 响应不可用："
-                f"url={log_url}, category={response_category}, HTTP={ret.status_code}, "
+                f"url={log_url}, category={response_category}, HTTP={status_code}, "
                 f"content_type={content_type or '-'}"
             )
             return []
 
-        body = ret.text
-        if not isinstance(body, str) or not body.strip():
+        if body_empty:
             self._record_error("empty", source="search")
             logger.debug(f"【{self.plugin_name}】torznab 空响应：url={log_url}")
             return []
         # Keep minidom bounded and reject DTD/entity declarations before the
         # parser sees them.  Normal Torznab RSS is small and has no DOCTYPE;
         # oversized/adversarial payloads are treated as an invalid response.
-        if len(body.encode("utf-8", errors="ignore")) > self.TORZNAB_MAX_XML_BYTES:
+        if isinstance(body, bytes):
+            body_size = len(body)
+        elif isinstance(body, str):
+            body_size = len(body.encode("utf-8", errors="ignore"))
+        else:
+            body_size = 0
+        if body_size > self.TORZNAB_MAX_XML_BYTES:
             self._record_error("xml_too_large", source="search")
             logger.warning(f"【{self.plugin_name}】torznab XML 超出大小限制：url={log_url}")
             return []
-        if re.search(r"<!DOCTYPE\b", body, flags=re.IGNORECASE):
+        try:
+            contains_dtd = contains_xml_dtd(body)
+        except (LookupError, UnicodeError) as e:
+            self._record_error("xml_error", source="search")
+            logger.warning(f"【{self.plugin_name}】torznab XML 编码扫描失败：url={log_url}, 类型={type(e).__name__}")
+            return []
+        if contains_dtd:
             self._record_error("xml_doctype", source="search")
             logger.warning(f"【{self.plugin_name}】torznab XML 含不支持的 DOCTYPE：url={log_url}")
             return []
@@ -1416,7 +1469,7 @@ class JackettExtend(_PluginBase):
                     seeders=safe_count(seeders),
                     peers=safe_count(peers),
                     grabs=safe_count(grabs),
-                    # V3 适配：显示真实站点名（原版硬编码 jackett_domain 导致结果来源显示无意义域名）
+                    # V3 适配：结果来源始终使用当前虚拟站点的真实身份。
                     site=site.get("id") if site else None,
                     site_name=site.get("name", self.plugin_name) if site else self.plugin_name,
                     site_cookie=site.get("cookie") if site else None,

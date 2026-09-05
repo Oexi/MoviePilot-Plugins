@@ -6,6 +6,7 @@ helpers are tested independently by their own contract tests.
 """
 
 import asyncio
+import codecs
 import importlib.util
 import json
 import sys
@@ -16,6 +17,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from xml.parsers.expat import ExpatError
+
+import requests
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -87,6 +90,16 @@ class _Response:
         if self._payload is not None:
             return self._payload
         return json.loads(self.text)
+
+
+def _real_xml_response(content):
+    """Build a real requests.Response around an exact wire payload."""
+    response = requests.Response()
+    response.status_code = 200
+    response.headers = {"Content-Type": "application/xml"}
+    response._content = content
+    response._content_consumed = True
+    return response
 
 
 @contextmanager
@@ -223,16 +236,24 @@ def site_oper_modules(site_oper, eventmanager, event_type):
 
 
 class ProwlarrV3ContractTest(unittest.TestCase):
+    def test_host_normalization_rejects_non_http_explicit_schemes(self):
+        with loaded_module() as module:
+            normalize = module.ProwlarrExtend._normalize_host
+            self.assertEqual(normalize("prowlarr:9696"), "http://prowlarr:9696")
+            self.assertEqual(normalize("https://prowlarr:9696/base/"), "https://prowlarr:9696/base")
+            self.assertEqual(normalize("ftp://prowlarr:9696"), "")
+            self.assertEqual(normalize("http://user:pass@prowlarr:9696"), "")
+
     def test_metadata_module_and_async_search_contract(self):
         manifest = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["ProwlarrExtend"]["version"], "1.0.4")
+        self.assertEqual(manifest["ProwlarrExtend"]["version"], "1.0.5")
         self.assertEqual(manifest["ProwlarrExtend"]["icon"], "Prowlarr.png")
-        self.assertEqual(manifest["ProwlarrExtend"]["author"], "Oexi")
-        self.assertEqual(manifest["JackettExtend"]["version"], "3.2.17")
+        self.assertEqual(manifest["ProwlarrExtend"]["author"], "oexi")
+        self.assertEqual(manifest["JackettExtend"]["version"], "3.2.18")
         with loaded_module() as module:
             self.assertEqual(module.ProwlarrExtend.plugin_icon, "Prowlarr.png")
-            self.assertEqual(module.ProwlarrExtend.plugin_author, "Oexi")
-            self.assertEqual(module.ProwlarrExtend.plugin_version, "1.0.4")
+            self.assertEqual(module.ProwlarrExtend.plugin_author, "oexi")
+            self.assertEqual(module.ProwlarrExtend.plugin_version, "1.0.5")
             self.assertEqual(module.ProwlarrExtend.plugin_config_prefix, "prowlarr_extend_")
 
             plugin = object.__new__(module.ProwlarrExtend)
@@ -725,6 +746,115 @@ class ProwlarrV3ContractTest(unittest.TestCase):
             self.assertEqual(len(results), 1)
             self.assertEqual(results[0].title, "Wire Release")
             self.assertEqual(results[0].enclosure, "https://site/wire.torrent")
+
+    def test_parser_rejects_dtd_in_all_supported_wire_encodings(self):
+        with loaded_module() as module:
+            plugin = object.__new__(module.ProwlarrExtend)
+            plugin._config_snapshot = {
+                "host": "https://prowlarr.invalid",
+                "api_key": "not-a-real-key",
+                "proxy": False,
+                "timeout": 9,
+            }
+            plugin._last_error = None
+            plugin._state_lock = module.ProwlarrExtend._state_lock
+
+            class Request:
+                response = None
+
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                def get_res(self, *_args, **_kwargs):
+                    return self.response
+
+            module.RequestUtils = Request
+            encodings = (
+                ("utf-8", "UTF-8", codecs.BOM_UTF8),
+                ("utf-16-le", "UTF-16", codecs.BOM_UTF16_LE),
+                ("utf-16-be", "UTF-16", codecs.BOM_UTF16_BE),
+                ("utf-32-le", "UTF-32", codecs.BOM_UTF32_LE),
+                ("utf-32-be", "UTF-32", codecs.BOM_UTF32_BE),
+            )
+            for encoding, declaration, bom in encodings:
+                for with_declaration in (False, True):
+                    for with_bom in (False, True):
+                        with self.subTest(
+                                encoding=encoding,
+                                with_declaration=with_declaration,
+                                with_bom=with_bom):
+                            xml = (
+                                f'<?xml version="1.0" encoding="{declaration}"?>'
+                                if with_declaration else ""
+                            ) + (
+                                '<!DOCTYPE rss [<!ENTITY x "expanded">]>'
+                                '<rss><channel><item><title>&x;</title>'
+                                '<enclosure url="https://site/release.torrent"/>'
+                                '</item></channel></rss>'
+                            )
+                            content = xml.encode(encoding)
+                            if with_bom:
+                                content = bom + content
+                            response = _real_xml_response(content)
+                            self.assertIsInstance(response, requests.Response)
+                            Request.response = response
+                            plugin._last_search_error = None
+
+                            self.assertEqual(
+                                plugin._ProwlarrExtend__parse_torznab_xml(
+                                    "https://prowlarr.invalid/results?q=private-title&apikey=secret"
+                                ),
+                                [],
+                            )
+                            self.assertEqual(plugin._last_search_error, "xml_doctype")
+
+    def test_parser_preserves_xml_declaration_encoding_for_real_response(self):
+        with loaded_module() as module:
+            plugin = object.__new__(module.ProwlarrExtend)
+            plugin._config_snapshot = {
+                "host": "https://prowlarr.invalid",
+                "api_key": "not-a-real-key",
+                "proxy": False,
+                "timeout": 9,
+            }
+            plugin._last_error = None
+            plugin._state_lock = module.ProwlarrExtend._state_lock
+
+            class Request:
+                response = None
+
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                def get_res(self, *_args, **_kwargs):
+                    return self.response
+
+            module.RequestUtils = Request
+            cases = (
+                ("utf-8", "UTF-8", "中文标题"),
+                ("utf-16-le", "UTF-16", "日本語タイトル"),
+                ("utf-16-be", "UTF-16", "中文と日本語"),
+                ("iso-8859-1", "ISO-8859-1", "Café release"),
+            )
+            for encoding, declaration, title in cases:
+                with self.subTest(encoding=encoding):
+                    xml = (
+                        f'<?xml version="1.0" encoding="{declaration}"?><rss><channel>'
+                        f'<item><title>{title}</title>'
+                        '<enclosure url="https://site/release.torrent"/>'
+                        '</item></channel></rss>'
+                    )
+                    Request.response = _real_xml_response(xml.encode(encoding))
+                    plugin._last_search_error = None
+
+                    result = plugin._ProwlarrExtend__parse_torznab_xml(
+                        "https://prowlarr.invalid/results",
+                        site={"name": "Encoding Site"},
+                    )
+
+                    self.assertEqual(len(result), 1)
+                    self.assertEqual(result[0].title, title)
+                    self.assertIsNone(plugin._last_search_error)
 
     def test_service_config_and_diagnostics_are_current_v3_contracts(self):
         with loaded_module() as module:
