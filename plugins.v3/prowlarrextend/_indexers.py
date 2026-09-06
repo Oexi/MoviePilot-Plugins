@@ -10,6 +10,7 @@ the entry point owns those concerns.
 
 import ast
 import copy
+import hashlib
 import math
 import re
 from typing import Any, Mapping, Optional, Sequence
@@ -28,6 +29,21 @@ PRIVACY_UNKNOWN = "unknown"
 MIN_INDEXER_ID = 1
 MAX_INDEXER_ID = 2_147_483_647
 _MAX_INDEXER_ID_TEXT_LENGTH = len(str(MAX_INDEXER_ID))
+
+
+def build_instance_domain_prefix(historical_prefix: object, instance_id: object) -> str:
+    """为虚拟实例生成稳定且不覆盖源实例的合成域名前缀。
+
+    源实例继续使用已有前缀；分身使用运行实例 ID 的可读片段和摘要，既能
+    在日志/站点列表中定位实例，也能把超过 DNS 标签长度的合法实例 ID 安全
+    地压缩到固定范围。摘要还避免了仅截断前缀导致的同名空间碰撞。
+    """
+    base = str(historical_prefix or "").strip().rstrip(".").lower() or "virtual"
+    identity = str(instance_id or "").strip()
+    identity_slug = re.sub(r"[^a-z0-9]+", "-", identity.lower()).strip("-")
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+    namespace = f"{identity_slug[:24] or 'instance'}-{digest}"
+    return f"{base}_{namespace}."
 
 
 _PRIVACY_ALIASES = {
@@ -405,6 +421,7 @@ def build_indexer_profiles(
         proxy: bool,
         plugin_name: str = "ProwlarrExtend",
         domain_prefix: str = "prowlarr_extend.",
+        owner_id: Optional[str] = None,
 ) -> list:
     """Build MoviePilot profiles from eligible Prowlarr API rows.
 
@@ -416,6 +433,7 @@ def build_indexer_profiles(
         return []
     normalized_host = str(host or "").strip().rstrip("/")
     plugin = str(plugin_name or "ProwlarrExtend").strip() or "ProwlarrExtend"
+    owner = str(owner_id or plugin).strip() or plugin
     prefix = str(domain_prefix or "prowlarr_extend.").strip() or "prowlarr_extend."
     profiles = []
     seen_ids = set()
@@ -440,8 +458,8 @@ def build_indexer_profiles(
             "public": privacy == PRIVACY_PUBLIC,
             "privacy": privacy,
             "proxy": bool(proxy),
-            "plugin": plugin,
-            "parser": plugin,
+            "plugin": owner,
+            "parser": owner,
             "category": category_for_capabilities(value.get("capabilities")),
         })
     return profiles

@@ -40,6 +40,7 @@ from ._response import ResponseBodyTooLarge, ResponseReadTimeout, read_limited_r
 from . import _host_compat
 from ._indexers import (
     apply_indexer_selection,
+    build_instance_domain_prefix,
     build_indexer_profiles,
     indexer_id_from_domain,
     is_virtual_site,
@@ -48,6 +49,7 @@ from ._indexers import (
 )
 from ._ui import build_form, build_page
 from ._site_registry import open_site_registry
+from ._api_models import JackettStatusResponse, JackettTestResponse
 
 class JackettExtend(_PluginBase):
     # 插件名称
@@ -57,7 +59,7 @@ class JackettExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Jackett_A.png"
     # 插件版本
-    plugin_version = "3.2.19"
+    plugin_version = "3.2.20"
     # 插件作者
     plugin_author = "oexi"
     # 作者主页
@@ -121,6 +123,34 @@ class JackettExtend(_PluginBase):
     _sync_stop_event = None
     _sync_generation = 0
 
+    @classmethod
+    def _runtime_instance_id(cls) -> str:
+        """返回宿主为当前运行类分配的稳定实例 ID。"""
+        return str(getattr(cls, "__name__", "") or cls.plugin_name).strip()
+
+    @classmethod
+    def _is_virtual_instance(cls) -> bool:
+        """判断当前类是否由宿主按虚拟分身合同适配。"""
+        return bool(getattr(cls, "is_clone", False))
+
+    @classmethod
+    def _site_domain_prefix(cls) -> str:
+        """返回当前实例使用的站点域名前缀。"""
+        historical_prefix = cls._domain_prefixes[0]
+        if cls._is_virtual_instance():
+            return build_instance_domain_prefix(
+                historical_prefix,
+                cls._runtime_instance_id(),
+            )
+        return historical_prefix
+
+    def _bridge_owner_key_for_runtime(self) -> str:
+        """返回 bridge 使用的实例级 owner key。"""
+        owner_key = self._runtime_instance_id()
+        if getattr(self, "_bridge_owner_key", None) != owner_key:
+            self._bridge_owner_key = owner_key
+        return owner_key
+
     def init_plugin(self, config: dict = None):
         """
         初始化插件
@@ -128,6 +158,7 @@ class JackettExtend(_PluginBase):
         # Stop only the previous runtime before replacing shared configuration.
         # Lifecycle cleanup belongs to public stop_service(); doing it here
         # would delete sites during an enabled -> enabled configuration reload.
+        self._bridge_owner_key = self._runtime_instance_id()
         self._stop_runtime()
 
         try:
@@ -219,7 +250,11 @@ class JackettExtend(_PluginBase):
         # Install after the new configuration snapshot is published, so a
         # host search arriving immediately after enable sees the current
         # generation.  The bridge lazily feature-detects the host boundary.
-        _host_compat.install(self, predicate=self._is_virtual_site)
+        _host_compat.install(
+            self,
+            predicate=self._is_virtual_site,
+            owner_key=self._bridge_owner_key_for_runtime(),
+        )
 
         # Validate the cron expression here so the shared host scheduler only
         # ever receives a known-good trigger.  The initial synchronization is
@@ -240,7 +275,7 @@ class JackettExtend(_PluginBase):
         self._sync_thread = threading.Thread(
             target=self.__sync_all,
             kwargs={"generation": generation},
-            name=f"{self.plugin_config_prefix}sync-initial",
+            name=f"{self._service_id()}-initial",
             daemon=True,
         )
         self._sync_thread.start()
@@ -332,9 +367,11 @@ class JackettExtend(_PluginBase):
             return True
 
     @classmethod
-    def _domain_prefix_set(cls):
+    def _domain_prefix_set(cls) -> tuple:
         """Return normalized virtual-domain prefixes used by persisted rows."""
-        return tuple(prefix.lower() for prefix in cls._domain_prefixes)
+        if not cls._is_virtual_instance():
+            return tuple(prefix.lower() for prefix in cls._domain_prefixes)
+        return (cls._site_domain_prefix().lower(),)
 
     @classmethod
     def _indexer_id_from_domain(cls, domain: object) -> str:
@@ -347,7 +384,7 @@ class JackettExtend(_PluginBase):
         return is_virtual_site(
             site,
             domain=domain,
-            plugin_name=cls.plugin_name,
+            plugin_name=cls._runtime_instance_id(),
             domain_prefixes=cls._domain_prefix_set(),
         )
 
@@ -600,6 +637,12 @@ class JackettExtend(_PluginBase):
     def get_state(self) -> bool:
         return self._enabled
 
+    def _service_id(self) -> str:
+        """返回不与其它运行实例冲突的内部服务 ID。"""
+        if self._is_virtual_instance():
+            return f"{self._runtime_instance_id().lower()}_sync"
+        return f"{str(self.plugin_config_prefix or '').strip()}sync"
+
     def get_service(self) -> List[Dict[str, Any]]:
         """Expose the indexer refresh job to MoviePilot's shared scheduler."""
         with self._state_lock:
@@ -618,7 +661,7 @@ class JackettExtend(_PluginBase):
                 trigger = CronTrigger.from_crontab(self._cron, timezone=settings.TZ)
             # H2: max_instances=1 + coalesce=True，避免同步回调并发操作。
             return [{
-                "id": f"{self.plugin_config_prefix}sync",
+                "id": self._service_id(),
                 "name": f"{self.plugin_name} indexer sync",
                 "trigger": trigger,
                 "func": self.__sync_all,
@@ -632,7 +675,10 @@ class JackettExtend(_PluginBase):
 
     def _stop_runtime(self):
         """Stop runtime resources without deleting persisted site rows."""
-        _host_compat.uninstall(self)
+        _host_compat.uninstall(
+            self,
+            owner_key=self._bridge_owner_key_for_runtime(),
+        )
         event = getattr(self, "_sync_stop_event", None)
         if event is not None:
             event.set()
@@ -737,8 +783,8 @@ class JackettExtend(_PluginBase):
             site_registry = open_site_registry()
             exists = site_registry.get_by_domain(domain)
             name = indexer.get("name", "")
-            # 站点地址必须与插件"查看数据"给出的格式一致(https://jackett_extend.xxx/),
-            # 官方 add_site 同样校正为 {scheme}://{netloc}/;torznab API 地址会导致校验失败
+            # 站点地址必须与插件"查看数据"给出的合成域名格式一致；Torznab API
+            # 地址会导致宿主站点校验失败。
             url = f"https://{domain}/"
             public = 1 if indexer.get("public") else 0
             if not self._sync_is_current(generation):
@@ -760,8 +806,17 @@ class JackettExtend(_PluginBase):
                     "pri": 1,
                 }
                 try:
-                    site_registry.add(**payload)
-                    logger.info(f"【{self.plugin_name}】已注册站点到 DB: {domain}")
+                    added = site_registry.add(**payload)
+                    if added is False:
+                        # Current V3 SiteOper.add reports duplicate/race conflicts
+                        # as (False, message) instead of necessarily raising.
+                        existing = site_registry.get_by_domain(domain)
+                        if not existing:
+                            raise RuntimeError("site add rejected without persisted row")
+                        site_registry.update(existing.id, {"name": name, "url": url, "public": public})
+                        logger.debug(f"【{self.plugin_name}】站点已存在(并发注册返回失败),转为更新: {domain}")
+                    else:
+                        logger.info(f"【{self.plugin_name}】已注册站点到 DB: {domain}")
                 except Exception as e:
                     # B2: 并发下重复插入等冲突,重新查询,已存在则转更新分支
                     existing = site_registry.get_by_domain(domain)
@@ -1218,7 +1273,8 @@ class JackettExtend(_PluginBase):
             host=host,
             proxy=proxy,
             plugin_name=self.plugin_name,
-            domain_prefix=self._domain_prefixes[0],
+            domain_prefix=self._site_domain_prefix(),
+            owner_id=self._runtime_instance_id(),
         )
 
         logger.info(f"【{self.plugin_name}】获取到 {len(indexers)} 个 Jackett indexers")
@@ -1266,12 +1322,16 @@ class JackettExtend(_PluginBase):
                 "path": "/test",
                 "endpoint": self.api_test,
                 "methods": ["GET"],
+                "auth": "apikey",
+                "response_model": JackettTestResponse,
                 "summary": "JackettExtend 只读连接测试",
             },
             {
                 "path": "/status",
                 "endpoint": self.api_status,
                 "methods": ["GET"],
+                "auth": "apikey",
+                "response_model": JackettStatusResponse,
                 "summary": "JackettExtend 同步状态（脱敏）",
             },
         ]
@@ -1339,15 +1399,15 @@ class JackettExtend(_PluginBase):
             "probe_error_at": probe_error_at or None,
         }
 
-    def api_test(self) -> Dict[str, Any]:
+    def api_test(self) -> JackettTestResponse:
         """Read-only connectivity probe with redacted, aggregate output."""
         payload = self._diagnostic_payload(probe=True)
         payload["ok"] = bool(payload["connected"])
-        return payload
+        return JackettTestResponse.model_validate(payload)
 
-    def api_status(self) -> Dict[str, Any]:
+    def api_status(self) -> JackettStatusResponse:
         """Read-only cached state endpoint; it never starts synchronization."""
-        return self._diagnostic_payload(probe=False)
+        return JackettStatusResponse.model_validate(self._diagnostic_payload(probe=False))
 
     @staticmethod
     def __mask_keyword(keyword):

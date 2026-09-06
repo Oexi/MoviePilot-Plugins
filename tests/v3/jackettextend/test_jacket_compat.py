@@ -1,26 +1,14 @@
 import asyncio
+import importlib
 import inspect
-import importlib.util
-import sys
-import types
 import unittest
-from pathlib import Path
 from types import MappingProxyType
 
-
-ROOT = Path(__file__).resolve().parents[1]
-PACKAGE_PATH = ROOT / "plugins.v3" / "jackettextend"
+from importlib import import_module
 
 
-def load_helper(filename, name):
-    spec = importlib.util.spec_from_file_location(name, PACKAGE_PATH / filename)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-INDEXERS = load_helper("_indexers.py", "jackettextend_indexers_isolated")
-COMPAT = load_helper("_host_compat.py", "jackettextend_host_compat_isolated")
+INDEXERS = import_module("app.plugins.jackettextend._indexers")
+COMPAT = import_module("app.plugins.jackettextend._host_compat")
 
 
 class Owner:
@@ -97,15 +85,10 @@ def make_chain():
 
 class HostCompatTest(unittest.TestCase):
     def setUp(self):
-        self.previous_app = sys.modules.get("app")
-        self.previous_chain = sys.modules.get("app.chain")
+        self.host_chain = import_module("app.chain")
+        self.previous_chain_base = self.host_chain.ChainBase
         self.ChainBase, self.host_calls = make_chain()
-        app = types.ModuleType("app")
-        chain = types.ModuleType("app.chain")
-        chain.ChainBase = self.ChainBase
-        app.chain = chain
-        sys.modules["app"] = app
-        sys.modules["app.chain"] = chain
+        self.host_chain.ChainBase = self.ChainBase
 
     def tearDown(self):
         # Restore an owner if a test intentionally left one installed.
@@ -114,14 +97,7 @@ class HostCompatTest(unittest.TestCase):
             owner = COMPAT._owner_from_state(state)
             if owner is not None:
                 COMPAT.uninstall(owner)
-        if self.previous_app is None:
-            sys.modules.pop("app", None)
-        else:
-            sys.modules["app"] = self.previous_app
-        if self.previous_chain is None:
-            sys.modules.pop("app.chain", None)
-        else:
-            sys.modules["app.chain"] = self.previous_chain
+        self.host_chain.ChainBase = self.previous_chain_base
 
     def test_predicate_routes_only_jackett_sites_and_leaves_page_size_to_host(self):
         owner = Owner()
@@ -463,9 +439,7 @@ class HostCompatTest(unittest.TestCase):
         old_state = getattr(self.ChainBase, COMPAT._STATE_ATTR)
         page_original = inspect.getattr_static(self.ChainBase, "get_search_page_size")
 
-        reloaded = load_helper(
-            "_host_compat.py", "jackettextend_host_compat_reloaded"
-        )
+        reloaded = importlib.reload(COMPAT)
         second = Owner("second")
         self.assertTrue(reloaded.install(second))
         self.assertIs(self.ChainBase.search_site_torrents, old_sync)

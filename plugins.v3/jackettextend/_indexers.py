@@ -9,6 +9,7 @@ here so they can be tested in isolation.
 
 import ast
 import copy
+import hashlib
 import re
 from typing import Mapping, Optional, Sequence
 from urllib.parse import quote, unquote
@@ -38,6 +39,21 @@ _CATEGORY_RANGES = (
     ("music", 3000, 4000),
     ("tv", 5000, 6000),
 )
+
+
+def build_instance_domain_prefix(historical_prefix: object, instance_id: object) -> str:
+    """为虚拟实例生成稳定且不覆盖源实例的合成域名前缀。
+
+    源实例继续使用已有前缀；分身使用运行实例 ID 的可读片段和摘要，既能
+    在日志/站点列表中定位实例，也能把超过 DNS 标签长度的合法实例 ID 安全
+    地压缩到固定范围。摘要还避免了仅截断前缀导致的同名空间碰撞。
+    """
+    base = str(historical_prefix or "").strip().rstrip(".").lower() or "virtual"
+    identity = str(instance_id or "").strip()
+    identity_slug = re.sub(r"[^a-z0-9]+", "-", identity.lower()).strip("-")
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+    namespace = f"{identity_slug[:24] or 'instance'}-{digest}"
+    return f"{base}_{namespace}."
 
 
 def normalize_privacy(value: object) -> Optional[str]:
@@ -202,7 +218,8 @@ def is_virtual_site(site: object,
     # solely because an old synthetic hostname happens to remain.
     if any(markers):
         return bool(marker and marker in markers)
-    return bool(indexer_id_from_domain(domain, domain_prefixes))
+    candidate_domain = domain or str(site.get("domain") or "")
+    return bool(indexer_id_from_domain(candidate_domain, domain_prefixes))
 
 
 def _category_for_caps(caps: object) -> dict:
@@ -230,7 +247,8 @@ def build_indexer_profiles(raw_indexers: object,
                            host: str,
                            proxy: bool,
                            plugin_name: str = "JackettExtend",
-                           domain_prefix: str = "jackett_extend.") -> list:
+                           domain_prefix: str = "jackett_extend.",
+                           owner_id: Optional[str] = None) -> list:
     """Build host-facing profiles from a Jackett indexer response.
 
     Invalid rows are ignored and special IDs are URL/domain encoded while the
@@ -239,6 +257,7 @@ def build_indexer_profiles(raw_indexers: object,
     if not isinstance(raw_indexers, list):
         return []
     normalized_host = str(host or "").rstrip("/")
+    owner = str(owner_id or plugin_name or "JackettExtend").strip() or "JackettExtend"
     profiles = []
     for value in raw_indexers:
         if not isinstance(value, Mapping):
@@ -268,8 +287,8 @@ def build_indexer_profiles(raw_indexers: object,
             "privacy": privacy,
             "proxy": bool(proxy),
             # Keep explicit ownership markers on every injected profile.
-            "plugin": plugin_name,
-            "parser": plugin_name,
+            "plugin": owner,
+            "parser": owner,
             "category": _category_for_caps(value.get("caps")),
         })
     return profiles

@@ -1,26 +1,17 @@
-import importlib.util
-import sys
-import types
 import unittest
 import xml.dom.minidom
 import xml.etree.ElementTree as ElementTree
 from pathlib import Path
 
+from importlib import import_module
 
-ROOT = Path(__file__).resolve().parents[1]
-MODULE_PATH = ROOT / "plugins.v3" / "jackettextend" / "_torznab.py"
-PACKAGE_PATH = MODULE_PATH.parent
+
+ROOT = Path(__file__).resolve().parents[3]
 FIXTURES = ROOT / "tests" / "fixtures"
 TORZNAB_NS = "{http://torznab.com/schemas/2015/feed}"
 
-PACKAGE_NAME = "jackettextend_torznab_testpkg"
-PACKAGE = types.ModuleType(PACKAGE_NAME)
-PACKAGE.__path__ = [str(PACKAGE_PATH)]
-sys.modules[PACKAGE_NAME] = PACKAGE
-SPEC = importlib.util.spec_from_file_location(f"{PACKAGE_NAME}._torznab", MODULE_PATH)
-MODULE = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = MODULE
-SPEC.loader.exec_module(MODULE)
+# 纯解析模块也必须以生产模块身份加载，避免同一源码出现第二个模块实例。
+MODULE = import_module("app.plugins.jackettextend._torznab")
 
 
 def fixture_fields(name):

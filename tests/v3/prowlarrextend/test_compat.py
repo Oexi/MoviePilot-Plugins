@@ -1,22 +1,13 @@
 import asyncio
+import importlib
 import inspect
-import importlib.util
-import sys
-import types
 import unittest
-from pathlib import Path
+
+from importlib import import_module
 
 
-ROOT = Path(__file__).resolve().parents[1]
-JACKETT_PATH = ROOT / "plugins.v3" / "jackettextend" / "_host_compat.py"
-PROWLARR_PATH = ROOT / "plugins.v3" / "prowlarrextend" / "_host_compat.py"
-
-
-def load_compat(path, name):
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+JACKETT_COMPAT = import_module("app.plugins.jackettextend._host_compat")
+PROWLARR_COMPAT = import_module("app.plugins.prowlarrextend._host_compat")
 
 
 class Owner:
@@ -62,8 +53,8 @@ class ProwlarrCompatContractTest(unittest.TestCase):
         return owns
 
     def _exercise_load_order(self, first_name):
-        jackett_compat = load_compat(JACKETT_PATH, f"jackett_compat_{first_name}")
-        prowlarr_compat = load_compat(PROWLARR_PATH, f"prowlarr_compat_{first_name}")
+        jackett_compat = JACKETT_COMPAT
+        prowlarr_compat = PROWLARR_COMPAT
         calls = []
 
         class ChainBase:
@@ -83,12 +74,9 @@ class ProwlarrCompatContractTest(unittest.TestCase):
                 calls.append(("async-refresh", site, keyword))
                 return ["host"]
 
-        app = types.ModuleType("app")
-        chain = types.ModuleType("app.chain")
-        chain.ChainBase = ChainBase
-        app.chain = chain
-        previous = {"app": sys.modules.get("app"), "app.chain": sys.modules.get("app.chain")}
-        sys.modules.update({"app": app, "app.chain": chain})
+        host_chain = import_module("app.chain")
+        previous_chain_base = host_chain.ChainBase
+        host_chain.ChainBase = ChainBase
         try:
             jackett = Owner("jackett", "JackettExtend")
             prowlarr = Owner("prowlarr", "ProwlarrExtend")
@@ -265,11 +253,7 @@ class ProwlarrCompatContractTest(unittest.TestCase):
                     owner = jackett_compat._owner_from_record(record)
                     if owner is not None:
                         jackett_compat.uninstall(owner, owner_key=key)
-            for name, value in previous.items():
-                if value is None:
-                    sys.modules.pop(name, None)
-                else:
-                    sys.modules[name] = value
+            host_chain.ChainBase = previous_chain_base
 
     def test_both_plugins_coexist_in_either_load_order_and_disable_order(self):
         for first_name in ("jackett", "prowlarr"):
@@ -277,7 +261,7 @@ class ProwlarrCompatContractTest(unittest.TestCase):
                 self._exercise_load_order(first_name)
 
     def test_refresh_fallbacks_preserve_host_and_propagate_cancellation(self):
-        compat = load_compat(JACKETT_PATH, "jackett_compat_refresh_errors")
+        compat = JACKETT_COMPAT
 
         class ChainBase:
             def search_site_torrents(self, site, keyword, *args, **kwargs):
@@ -292,12 +276,9 @@ class ProwlarrCompatContractTest(unittest.TestCase):
             async def async_refresh_torrents(self, site, keyword, *args, **kwargs):
                 return ["host-async-refresh"]
 
-        app = types.ModuleType("app")
-        chain = types.ModuleType("app.chain")
-        chain.ChainBase = ChainBase
-        app.chain = chain
-        previous = {"app": sys.modules.get("app"), "app.chain": sys.modules.get("app.chain")}
-        sys.modules.update({"app": app, "app.chain": chain})
+        host_chain = import_module("app.chain")
+        previous_chain_base = host_chain.ChainBase
+        host_chain.ChainBase = ChainBase
         try:
             class ErrorOwner:
                 @staticmethod
@@ -343,16 +324,12 @@ class ProwlarrCompatContractTest(unittest.TestCase):
                     owner = compat._owner_from_record(record)
                     if owner is not None:
                         compat.uninstall(owner, owner_key=key)
-            for name, value in previous.items():
-                if value is None:
-                    sys.modules.pop(name, None)
-                else:
-                    sys.modules[name] = value
+            host_chain.ChainBase = previous_chain_base
 
     def test_same_key_reload_replaces_only_prowlarr_and_stale_owner_is_safe(self):
-        first_compat = load_compat(PROWLARR_PATH, "prowlarr_compat_reload_first")
-        second_compat = load_compat(PROWLARR_PATH, "prowlarr_compat_reload_second")
-        jackett_compat = load_compat(JACKETT_PATH, "jackett_compat_reload")
+        first_compat = PROWLARR_COMPAT
+        second_compat = importlib.reload(PROWLARR_COMPAT)
+        jackett_compat = JACKETT_COMPAT
 
         class ChainBase:
             def search_site_torrents(self, site, keyword, *args, **kwargs):
@@ -367,12 +344,9 @@ class ProwlarrCompatContractTest(unittest.TestCase):
             async def async_refresh_torrents(self, site, keyword, *args, **kwargs):
                 return ["host"]
 
-        app = types.ModuleType("app")
-        chain = types.ModuleType("app.chain")
-        chain.ChainBase = ChainBase
-        app.chain = chain
-        previous = {"app": sys.modules.get("app"), "app.chain": sys.modules.get("app.chain")}
-        sys.modules.update({"app": app, "app.chain": chain})
+        host_chain = import_module("app.chain")
+        previous_chain_base = host_chain.ChainBase
+        host_chain.ChainBase = ChainBase
         try:
             jackett = Owner("jackett", "JackettExtend")
             old = Owner("old-prowlarr", "ProwlarrExtend")
@@ -428,11 +402,7 @@ class ProwlarrCompatContractTest(unittest.TestCase):
                     owner = jackett_compat._owner_from_record(record)
                     if owner is not None:
                         jackett_compat.uninstall(owner, owner_key=key)
-            for name, value in previous.items():
-                if value is None:
-                    sys.modules.pop(name, None)
-                else:
-                    sys.modules[name] = value
+            host_chain.ChainBase = previous_chain_base
 
 
 if __name__ == "__main__":

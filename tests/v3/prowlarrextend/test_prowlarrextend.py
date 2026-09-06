@@ -1,15 +1,13 @@
 """Current MoviePilot V3 contracts for the Prowlarr extension.
 
-These tests deliberately load the plugin with small host shims.  They cover
-the boundary owned by the entry point while the pure indexer/Torznab/UI
-helpers are tested independently by their own contract tests.
+These tests import the plugin through the production ``app.plugins`` path.
+Boundary doubles only replace outbound responses and local persistence while
+the pure indexer/Torznab/UI helpers are tested independently.
 """
 
 import asyncio
 import codecs
-import importlib.util
 import json
-import sys
 import threading
 import types
 import unittest
@@ -19,12 +17,13 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from xml.parsers.expat import ExpatError
 
+from importlib import import_module
+
 import requests
 from urllib3.exceptions import ReadTimeoutError
 
 
-ROOT = Path(__file__).resolve().parents[1]
-PACKAGE_PATH = ROOT / "plugins.v3" / "prowlarrextend"
+ROOT = Path(__file__).resolve().parents[3]
 
 
 class _Logger:
@@ -166,135 +165,74 @@ def _real_stream_response(stream_factory, headers):
 
 @contextmanager
 def loaded_module():
-    names = {
-        "apscheduler": types.ModuleType("apscheduler"),
-        "apscheduler.triggers": types.ModuleType("apscheduler.triggers"),
-        "apscheduler.triggers.cron": types.ModuleType("apscheduler.triggers.cron"),
-        "app": types.ModuleType("app"),
-        "app.plugins": types.ModuleType("app.plugins"),
-        "app.schemas": types.ModuleType("app.schemas"),
-        "app.schemas.types": types.ModuleType("app.schemas.types"),
-        "app.sdk": types.ModuleType("app.sdk"),
-        "app.sdk.config": types.ModuleType("app.sdk.config"),
-        "app.sdk.logging": types.ModuleType("app.sdk.logging"),
-        "app.sdk.media": types.ModuleType("app.sdk.media"),
-        "app.sdk.network": types.ModuleType("app.sdk.network"),
-        "app.sdk.utilities": types.ModuleType("app.sdk.utilities"),
+    module = import_module("app.plugins.prowlarrextend")
+    patched = {
+        "MediaType": _MediaType,
+        "MediaSource": _MediaSource,
+        "TorrentInfo": _TorrentInfo,
+        "StringUtils": _StringUtils,
+        "CronTrigger": _CronTrigger,
+        "logger": _Logger(),
+        "settings": types.SimpleNamespace(
+            PROXY={"http": "http://proxy.invalid"},
+            TZ="UTC",
+            USER_AGENT="test",
+        ),
+        "asyncio": types.SimpleNamespace(to_thread=asyncio.to_thread),
     }
-    names["apscheduler.triggers.cron"].CronTrigger = _CronTrigger
-    names["app.plugins"]._PluginBase = object
-    names["app.schemas"].MediaType = _MediaType
-    names["app.schemas"].__path__ = []
-    names["app.schemas.types"].MediaSource = _MediaSource
-    names["app.sdk"].__path__ = []
-    names["app.sdk.config"].settings = types.SimpleNamespace(
-        PROXY={"http": "http://proxy.invalid"}, TZ="UTC", USER_AGENT="test"
-    )
-    names["app.sdk.logging"].logger = _Logger()
-    names["app.sdk.media"].TorrentInfo = _TorrentInfo
-    names["app.sdk.network"].RequestUtils = object
-    names["app.sdk.network"].SitesHelper = object
-    names["app.sdk.utilities"].StringUtils = _StringUtils
-
-    previous = {name: sys.modules.get(name) for name in names}
-    package_name = "prowlarrextend_v3_test"
-    previous_package = sys.modules.get(package_name)
+    previous = {name: getattr(module, name) for name in patched}
     try:
-        sys.modules.update(names)
-        spec = importlib.util.spec_from_file_location(
-            package_name,
-            PACKAGE_PATH / "__init__.py",
-            submodule_search_locations=[str(PACKAGE_PATH)],
-        )
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[package_name] = module
-        spec.loader.exec_module(module)
+        for name, value in patched.items():
+            setattr(module, name, value)
         yield module
     finally:
-        for name, previous_module in previous.items():
-            if previous_module is None:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = previous_module
-        if previous_package is None:
-            sys.modules.pop(package_name, None)
-        else:
-            sys.modules[package_name] = previous_package
-        for name in list(sys.modules):
-            if name.startswith(f"{package_name}."):
-                sys.modules.pop(name, None)
+        _uninstall_loaded_plugin_bridge(module)
+        for name, value in previous.items():
+            setattr(module, name, value)
+
+
+def _uninstall_loaded_plugin_bridge(module) -> None:
+    """回收该生产模块在宿主 ChainBase 上留下的桥接 owner。"""
+    try:
+        from app.chain import ChainBase
+
+        compat = module._host_compat
+        state = getattr(ChainBase, compat._STATE_ATTR, None)
+        if not isinstance(state, dict):
+            return
+        owners = state.get("owners")
+        if isinstance(owners, dict):
+            for key, record in list(owners.items()):
+                owner = compat._owner_from_record(record)
+                if owner is not None and owner.__class__.__module__ == module.__name__:
+                    compat.uninstall(owner, owner_key=key)
+            return
+        owner = compat._owner_from_state(state)
+        if owner is not None and owner.__class__.__module__ == module.__name__:
+            compat.uninstall(owner)
+    except Exception:  # noqa: BLE001  测试收尾不得掩盖原断言
+        return
 
 
 @contextmanager
 def site_oper_modules(site_oper, eventmanager, event_type):
-    """Install isolated current V3 DB/event import shims."""
-    names = [
-        "app",
-        "app.db",
-        "app.db.oper",
-        "app.db.oper.site",
-        "app.sdk",
-        "app.sdk.events",
-        "app.schemas",
-        "app.schemas.types",
-    ]
-    previous = {name: sys.modules.get(name) for name in names}
-    parents = {
-        name: sys.modules.get(name)
-        for name in ("app", "app.db", "app.db.oper", "app.sdk", "app.schemas")
-    }
-    previous_attrs = {
-        (name, "__path__"): getattr(module, "__path__", None)
-        for name, module in parents.items()
-        if module is not None
-    }
+    """在真实宿主模块边界替换 Oper 与事件端口，并精确恢复属性。"""
+    from app.db.oper import site as site_module
+    from app.sdk import events as events_module
+    from app.schemas import types as schema_types
 
-    app = sys.modules.get("app") or types.ModuleType("app")
-    app.__path__ = []
-    db = types.ModuleType("app.db")
-    db.__path__ = []
-    oper = types.ModuleType("app.db.oper")
-    oper.__path__ = []
-    site = types.ModuleType("app.db.oper.site")
-    site.SiteOper = site_oper
-    sdk = sys.modules.get("app.sdk") or types.ModuleType("app.sdk")
-    sdk.__path__ = []
-    events = types.ModuleType("app.sdk.events")
-    events.eventmanager = eventmanager
-    schemas = sys.modules.get("app.schemas") or types.ModuleType("app.schemas")
-    schemas.__path__ = []
-    event_types = types.ModuleType("app.schemas.types")
-    event_types.EventType = event_type
-    sys.modules.update({
-        "app": app,
-        "app.db": db,
-        "app.db.oper": oper,
-        "app.db.oper.site": site,
-        "app.sdk": sdk,
-        "app.sdk.events": events,
-        "app.schemas": schemas,
-        "app.schemas.types": event_types,
-    })
-
+    previous_site_oper = site_module.SiteOper
+    previous_eventmanager = events_module.eventmanager
+    previous_event_type = schema_types.EventType
+    site_module.SiteOper = site_oper
+    events_module.eventmanager = eventmanager
+    schema_types.EventType = event_type
     try:
         yield
     finally:
-        for name, previous_module in previous.items():
-            if previous_module is None:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = previous_module
-        for (parent_name, attr), value in previous_attrs.items():
-            parent = sys.modules.get(parent_name)
-            if parent is None:
-                continue
-            if value is None:
-                try:
-                    delattr(parent, attr)
-                except AttributeError:
-                    pass
-            else:
-                setattr(parent, attr, value)
+        site_module.SiteOper = previous_site_oper
+        events_module.eventmanager = previous_eventmanager
+        schema_types.EventType = previous_event_type
 
 
 class ProwlarrV3ContractTest(unittest.TestCase):
@@ -312,7 +250,7 @@ class ProwlarrV3ContractTest(unittest.TestCase):
             self.assertEqual(manifest["ProwlarrExtend"]["version"], module.ProwlarrExtend.plugin_version)
             self.assertEqual(manifest["ProwlarrExtend"]["icon"], "Prowlarr.png")
             self.assertEqual(manifest["ProwlarrExtend"]["author"], "oexi")
-            self.assertEqual(manifest["JackettExtend"]["version"], "3.2.19")
+            self.assertEqual(manifest["JackettExtend"]["version"], "3.2.20")
         with loaded_module() as module:
             self.assertEqual(module.ProwlarrExtend.plugin_icon, "Prowlarr.png")
             self.assertEqual(module.ProwlarrExtend.plugin_author, "oexi")
@@ -1227,8 +1165,8 @@ class ProwlarrV3ContractTest(unittest.TestCase):
             rendered = repr(payload)
             self.assertNotIn("not-a-real-key", rendered)
             self.assertNotIn("user:", rendered)
-            self.assertNotIn("host", payload)
-            self.assertEqual(payload["last_error"], "timeout")
+            self.assertNotIn("host", payload.model_dump())
+            self.assertEqual(payload.last_error, "timeout")
 
             plugin._enabled = False
             self.assertEqual(plugin.get_service(), [])
@@ -1380,6 +1318,56 @@ class ProwlarrV3ContractTest(unittest.TestCase):
             )
             self.assertTrue(plugin._fetch_ok)
             self.assertEqual(result, [[]])
+
+    def test_register_site_add_false_contract_rechecks_and_updates(self):
+        with loaded_module() as module:
+            existing = types.SimpleNamespace(id=17, domain="prowlarr_extend.7")
+            state = types.SimpleNamespace(adds=[], lookups=[], updates=[], events=[])
+
+            class FakeSiteOper:
+                def get_by_domain(self, domain):
+                    state.lookups.append(domain)
+                    return None if len(state.lookups) == 1 else existing
+
+                def add(self, **payload):
+                    state.adds.append(payload)
+                    return False, "站点已存在"
+
+                def update(self, site_id, payload):
+                    state.updates.append((site_id, payload))
+
+            class EventManager:
+                def send_event(self, event, payload):
+                    state.events.append((event, payload))
+
+            event_type = types.SimpleNamespace(SiteUpdated="SiteUpdated")
+            plugin = object.__new__(module.ProwlarrExtend)
+            plugin._sync_stop_event = threading.Event()
+            plugin._sync_generation = 1
+
+            with site_oper_modules(FakeSiteOper, EventManager(), event_type):
+                result = plugin._ProwlarrExtend__register_site({
+                    "name": "Indexer 7",
+                    "domain": "prowlarr_extend.7",
+                    "public": True,
+                    "proxy": False,
+                }, generation=1)
+
+            self.assertTrue(result)
+            self.assertEqual(len(state.adds), 1)
+            self.assertEqual(state.lookups, ["prowlarr_extend.7", "prowlarr_extend.7"])
+            self.assertEqual(
+                state.updates,
+                [(17, {
+                    "name": "Indexer 7",
+                    "url": "https://prowlarr_extend.7/",
+                    "public": 1,
+                })],
+            )
+            self.assertEqual(
+                state.events,
+                [("SiteUpdated", {"domain": "prowlarr_extend.7"})],
+            )
 
     def test_lifecycle_cleanup_deletes_only_prowlarr_sites_and_is_idempotent(self):
         with loaded_module() as module:

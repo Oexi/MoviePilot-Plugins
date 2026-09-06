@@ -42,6 +42,7 @@ from . import _host_compat
 from ._indexers import (
     apply_indexer_selection,
     build_indexer_profiles,
+    build_instance_domain_prefix,
     indexer_id_from_domain,
     is_virtual_site,
     normalize_indexer_id,
@@ -50,6 +51,7 @@ from ._indexers import (
 )
 from ._ui import build_form, build_page
 from ._site_registry import open_site_registry
+from ._api_models import ProwlarrStatusResponse, ProwlarrTestResponse
 
 class ProwlarrExtend(_PluginBase):
     # 插件名称
@@ -59,7 +61,7 @@ class ProwlarrExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Prowlarr.png"
     # 插件版本
-    plugin_version = "1.0.6"
+    plugin_version = "1.0.7"
     # 插件作者
     plugin_author = "oexi"
     # 作者主页
@@ -112,8 +114,6 @@ class ProwlarrExtend(_PluginBase):
     _last_search_error = None
     _last_search_error_at = 0.0
     sites_helper = None
-    # Stable owner key for the shared V3 per-site search bridge.
-    _bridge_owner_key = "prowlarrextend"
 
     # E1: 索引器列表 TTL 缓存(内存 + 时间戳)
     _indexers_cache = None
@@ -130,6 +130,34 @@ class ProwlarrExtend(_PluginBase):
     _sync_stop_event = None
     _sync_generation = 0
 
+    @classmethod
+    def _runtime_instance_id(cls) -> str:
+        """返回宿主为当前运行类分配的稳定实例 ID。"""
+        return str(getattr(cls, "__name__", "") or cls.plugin_name).strip()
+
+    @classmethod
+    def _is_virtual_instance(cls) -> bool:
+        """判断当前类是否由宿主按虚拟分身合同适配。"""
+        return bool(getattr(cls, "is_clone", False))
+
+    @classmethod
+    def _site_domain_prefix(cls) -> str:
+        """返回当前实例使用的站点域名前缀。"""
+        historical_prefix = cls._domain_prefixes[0]
+        if cls._is_virtual_instance():
+            return build_instance_domain_prefix(
+                historical_prefix,
+                cls._runtime_instance_id(),
+            )
+        return historical_prefix
+
+    def _bridge_owner_key_for_runtime(self) -> str:
+        """返回 bridge 使用的实例级 owner key。"""
+        owner_key = self._runtime_instance_id()
+        if getattr(self, "_bridge_owner_key", None) != owner_key:
+            self._bridge_owner_key = owner_key
+        return owner_key
+
     def init_plugin(self, config: dict = None):
         """
         初始化插件
@@ -137,6 +165,7 @@ class ProwlarrExtend(_PluginBase):
         # Stop only the previous runtime before replacing shared configuration.
         # Lifecycle cleanup belongs to public stop_service(); doing it here
         # would delete sites during an enabled -> enabled configuration reload.
+        self._bridge_owner_key = self._runtime_instance_id()
         self._stop_runtime()
 
         try:
@@ -228,7 +257,7 @@ class ProwlarrExtend(_PluginBase):
         _host_compat.install(
             self,
             predicate=self._is_virtual_site,
-            owner_key=self._bridge_owner_key,
+            owner_key=self._bridge_owner_key_for_runtime(),
         )
 
         # Validate the cron expression here so the shared host scheduler only
@@ -250,7 +279,7 @@ class ProwlarrExtend(_PluginBase):
         self._sync_thread = threading.Thread(
             target=self.__sync_all,
             kwargs={"generation": generation},
-            name=f"{self.plugin_config_prefix}sync-initial",
+            name=f"{self._service_id()}-initial",
             daemon=True,
         )
         self._sync_thread.start()
@@ -343,9 +372,11 @@ class ProwlarrExtend(_PluginBase):
             return True
 
     @classmethod
-    def _domain_prefix_set(cls):
+    def _domain_prefix_set(cls) -> tuple:
         """Return normalized virtual-domain prefixes used by persisted rows."""
-        return tuple(prefix.lower() for prefix in cls._domain_prefixes)
+        if not cls._is_virtual_instance():
+            return tuple(prefix.lower() for prefix in cls._domain_prefixes)
+        return (cls._site_domain_prefix().lower(),)
 
     @classmethod
     def _indexer_id_from_domain(cls, domain: object) -> str:
@@ -358,7 +389,7 @@ class ProwlarrExtend(_PluginBase):
         return is_virtual_site(
             site,
             domain=domain,
-            plugin_name=cls.plugin_name,
+            plugin_name=cls._runtime_instance_id(),
             domain_prefixes=cls._domain_prefix_set(),
         )
 
@@ -611,6 +642,12 @@ class ProwlarrExtend(_PluginBase):
     def get_state(self) -> bool:
         return self._enabled
 
+    def _service_id(self) -> str:
+        """返回不与其它运行实例冲突的内部服务 ID。"""
+        if self._is_virtual_instance():
+            return f"{self._runtime_instance_id().lower()}_sync"
+        return f"{str(self.plugin_config_prefix or '').strip()}sync"
+
     def get_service(self) -> List[Dict[str, Any]]:
         """Expose the indexer refresh job to MoviePilot's shared scheduler."""
         with self._state_lock:
@@ -629,7 +666,7 @@ class ProwlarrExtend(_PluginBase):
                 trigger = CronTrigger.from_crontab(self._cron, timezone=settings.TZ)
             # H2: max_instances=1 + coalesce=True，避免同步回调并发操作。
             return [{
-                "id": f"{self.plugin_config_prefix}sync",
+                "id": self._service_id(),
                 "name": f"{self.plugin_name} indexer sync",
                 "trigger": trigger,
                 "func": self.__sync_all,
@@ -643,7 +680,10 @@ class ProwlarrExtend(_PluginBase):
 
     def _stop_runtime(self):
         """Stop runtime resources without deleting persisted site rows."""
-        _host_compat.uninstall(self, owner_key=self._bridge_owner_key)
+        _host_compat.uninstall(
+            self,
+            owner_key=self._bridge_owner_key_for_runtime(),
+        )
         event = getattr(self, "_sync_stop_event", None)
         if event is not None:
             event.set()
@@ -747,8 +787,8 @@ class ProwlarrExtend(_PluginBase):
             site_registry = open_site_registry()
             exists = site_registry.get_by_domain(domain)
             name = indexer.get("name", "")
-            # 站点地址必须与插件"查看数据"给出的格式一致(https://prowlarr_extend.xxx/),
-            # 官方 add_site 同样校正为 {scheme}://{netloc}/;torznab API 地址会导致校验失败
+            # 站点地址必须与插件"查看数据"给出的合成域名格式一致；Torznab API
+            # 地址会导致宿主站点校验失败。
             url = f"https://{domain}/"
             public = 1 if indexer.get("public") else 0
             if not self._sync_is_current(generation):
@@ -770,8 +810,17 @@ class ProwlarrExtend(_PluginBase):
                     "pri": 1,
                 }
                 try:
-                    site_registry.add(**payload)
-                    logger.info(f"【{self.plugin_name}】已注册站点到 DB: {domain}")
+                    added = site_registry.add(**payload)
+                    if added is False:
+                        # Current V3 SiteOper.add reports duplicate/race conflicts
+                        # as (False, message) instead of necessarily raising.
+                        existing = site_registry.get_by_domain(domain)
+                        if not existing:
+                            raise RuntimeError("site add rejected without persisted row")
+                        site_registry.update(existing.id, {"name": name, "url": url, "public": public})
+                        logger.debug(f"【{self.plugin_name}】站点已存在(并发注册返回失败),转为更新: {domain}")
+                    else:
+                        logger.info(f"【{self.plugin_name}】已注册站点到 DB: {domain}")
                 except Exception as e:
                     # B2: 并发下重复插入等冲突,重新查询,已存在则转更新分支
                     existing = site_registry.get_by_domain(domain)
@@ -1227,7 +1276,8 @@ class ProwlarrExtend(_PluginBase):
             host=host,
             proxy=proxy,
             plugin_name=self.plugin_name,
-            domain_prefix=self._domain_prefixes[0],
+            domain_prefix=self._site_domain_prefix(),
+            owner_id=self._runtime_instance_id(),
         )
 
         logger.info(f"【{self.plugin_name}】获取到 {len(indexers)} 个 Prowlarr indexers")
@@ -1278,12 +1328,16 @@ class ProwlarrExtend(_PluginBase):
                 "path": "/test",
                 "endpoint": self.api_test,
                 "methods": ["GET"],
+                "auth": "apikey",
+                "response_model": ProwlarrTestResponse,
                 "summary": "ProwlarrExtend 只读连接测试",
             },
             {
                 "path": "/status",
                 "endpoint": self.api_status,
                 "methods": ["GET"],
+                "auth": "apikey",
+                "response_model": ProwlarrStatusResponse,
                 "summary": "ProwlarrExtend 同步状态（脱敏）",
             },
         ]
@@ -1351,15 +1405,15 @@ class ProwlarrExtend(_PluginBase):
             "probe_error_at": probe_error_at or None,
         }
 
-    def api_test(self) -> Dict[str, Any]:
+    def api_test(self) -> ProwlarrTestResponse:
         """Read-only connectivity probe with redacted, aggregate output."""
         payload = self._diagnostic_payload(probe=True)
         payload["ok"] = bool(payload["connected"])
-        return payload
+        return ProwlarrTestResponse.model_validate(payload)
 
-    def api_status(self) -> Dict[str, Any]:
+    def api_status(self) -> ProwlarrStatusResponse:
         """Read-only cached state endpoint; it never starts synchronization."""
-        return self._diagnostic_payload(probe=False)
+        return ProwlarrStatusResponse.model_validate(self._diagnostic_payload(probe=False))
 
     @staticmethod
     def __mask_keyword(keyword):

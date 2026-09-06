@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 PLUGIN_METADATA = {
     "JackettExtend": (ROOT / "plugins.v3" / "jackettextend" / "__init__.py", "JackettExtend"),
     "ProwlarrExtend": (ROOT / "plugins.v3" / "prowlarrextend" / "__init__.py", "ProwlarrExtend"),

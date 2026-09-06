@@ -9,23 +9,53 @@ permissions:
 
 jobs:
   test:
+    name: V3 plugin tests
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - name: Check out repository
+      - name: Check out plugin repository
         uses: actions/checkout@v4
         with:
+          path: MoviePilot-Plugins
           fetch-depth: 0
-      - name: Set up Python
-        uses: actions/setup-python@v5
+
+      - name: Check out official MoviePilot V3 host
+        uses: actions/checkout@v4
         with:
-          python-version: "3.12"
-      - name: Install test dependency
-        run: python3 -m pip install --disable-pip-version-check requests
-      - name: Run unittest suite
-        run: python3 -m unittest discover -s tests -v
-      - name: Validate package manifest
-        run: python3 -m json.tool package.v3.json
+          repository: jxxghp/MoviePilot
+          ref: v3
+          path: MoviePilot
+
+      - name: Set up locked V3 host environment
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version-file: MoviePilot/pyproject.toml
+          python-version: "3.14"
+          enable-cache: true
+          cache-dependency-glob: |
+            MoviePilot/pyproject.toml
+            MoviePilot/uv.lock
+
+      - name: Install official host dependencies from uv.lock
+        working-directory: MoviePilot
+        run: uv sync --locked
+
+      - name: Run repository and V3 tests in isolated sessions
+        working-directory: MoviePilot-Plugins
+        env:
+          MOVIEPILOT_BACKEND_PATH: ${{ github.workspace }}/MoviePilot
+        run: ../MoviePilot/.venv/bin/python tests/run.py
+
+      - name: Validate V3 manifest JSON
+        working-directory: MoviePilot-Plugins
+        run: ../MoviePilot/.venv/bin/python -m json.tool package.v3.json >/dev/null
+
+      - name: Check canonical shared module mirrors
+        working-directory: MoviePilot-Plugins
+        run: ../MoviePilot/.venv/bin/python tools/sync_shared_modules.py --check
+
       - name: Check patch whitespace
+        working-directory: MoviePilot-Plugins
         env:
           BEFORE_SHA: ${{ github.event.before }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -53,5 +83,3 @@ jobs:
           fi
 
           git diff --check "$base_sha" "$head_sha"
-      - name: Check canonical shared module mirrors
-        run: python3 tools/sync_shared_modules.py --check

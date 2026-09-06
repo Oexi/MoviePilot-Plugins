@@ -1,14 +1,9 @@
-import importlib.util
-import sys
-import types
 import unittest
 from contextlib import contextmanager
-from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
-
-ROOT = Path(__file__).resolve().parents[1]
-PACKAGE_PATH = ROOT / "plugins.v3" / "jackettextend"
+from importlib import import_module
 
 
 class StringUtilsStub:
@@ -39,65 +34,20 @@ class LoggerStub:
 
 @contextmanager
 def loaded_plugin_module():
-    stubs = {
-        "apscheduler": types.ModuleType("apscheduler"),
-        "apscheduler.schedulers": types.ModuleType("apscheduler.schedulers"),
-        "apscheduler.schedulers.background": types.ModuleType("apscheduler.schedulers.background"),
-        "apscheduler.triggers": types.ModuleType("apscheduler.triggers"),
-        "apscheduler.triggers.cron": types.ModuleType("apscheduler.triggers.cron"),
-        "app": types.ModuleType("app"),
-        "app.plugins": types.ModuleType("app.plugins"),
-        "app.schemas": types.ModuleType("app.schemas"),
-        "app.schemas.types": types.ModuleType("app.schemas.types"),
-        "app.sdk": types.ModuleType("app.sdk"),
-        "app.sdk.config": types.ModuleType("app.sdk.config"),
-        "app.sdk.logging": types.ModuleType("app.sdk.logging"),
-        "app.sdk.media": types.ModuleType("app.sdk.media"),
-        "app.sdk.network": types.ModuleType("app.sdk.network"),
-        "app.sdk.utilities": types.ModuleType("app.sdk.utilities"),
+    module = import_module("app.plugins.jackettextend")
+    patched = {
+        "StringUtils": StringUtilsStub,
+        "logger": LoggerStub(),
+        "settings": SimpleNamespace(PROXY=None),
     }
-    stubs["apscheduler.schedulers.background"].BackgroundScheduler = object
-    stubs["apscheduler.triggers.cron"].CronTrigger = object
-    stubs["app.plugins"]._PluginBase = object
-    stubs["app.schemas"].MediaType = object
-    stubs["app.schemas"].__path__ = []
-    stubs["app.schemas.types"].MediaSource = object
-    stubs["app.sdk"].__path__ = []
-    stubs["app.sdk.config"].settings = types.SimpleNamespace(PROXY=None)
-    stubs["app.sdk.logging"].logger = LoggerStub()
-    stubs["app.sdk.media"].TorrentInfo = object
-    stubs["app.sdk.network"].RequestUtils = object
-    stubs["app.sdk.network"].SitesHelper = object
-    stubs["app.sdk.utilities"].DomUtils = object
-    stubs["app.sdk.utilities"].StringUtils = StringUtilsStub
-
-    previous = {name: sys.modules.get(name) for name in stubs}
-    package_name = "jackettextend_search_test"
-    previous_package = sys.modules.get(package_name)
+    previous = {name: getattr(module, name) for name in patched}
     try:
-        sys.modules.update(stubs)
-        spec = importlib.util.spec_from_file_location(
-            package_name,
-            PACKAGE_PATH / "__init__.py",
-            submodule_search_locations=[str(PACKAGE_PATH)],
-        )
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[package_name] = module
-        spec.loader.exec_module(module)
+        for name, value in patched.items():
+            setattr(module, name, value)
         yield module
     finally:
-        for name, previous_module in previous.items():
-            if previous_module is None:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = previous_module
-        if previous_package is None:
-            sys.modules.pop(package_name, None)
-        else:
-            sys.modules[package_name] = previous_package
-        for name in list(sys.modules):
-            if name.startswith(f"{package_name}."):
-                sys.modules.pop(name, None)
+        for name, value in previous.items():
+            setattr(module, name, value)
 
 
 class JackettSearchKeywordTest(unittest.TestCase):

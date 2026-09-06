@@ -6,7 +6,7 @@ MoviePilot 插件仓库，当前仅提供 **MoviePilot V3** 插件。
 
 ### JackettExtend
 
-- **版本**：3.2.19
+- **版本**：3.2.20
 - **适用版本**：MoviePilot V3
 - **功能**：
   - 同步 Jackett 中已配置的 indexer，并在 MoviePilot 中生成对应站点
@@ -18,7 +18,7 @@ MoviePilot 插件仓库，当前仅提供 **MoviePilot V3** 插件。
 
 ### ProwlarrExtend
 
-- **版本**：1.0.6
+- **版本**：1.0.7
 - **适用版本**：MoviePilot V3
 - **功能**：
   - 同步 Prowlarr 中已启用且支持搜索的 Torrent indexer，并在 MoviePilot 中生成对应站点
@@ -45,14 +45,32 @@ MoviePilot 插件仓库，当前仅提供 **MoviePilot V3** 插件。
 - `jackett_extend.<indexer>` 是 V3 已使用的虚拟站点标识，升级时会保留该前缀以兼容已有站点数据。
 - `prowlarr_extend.<indexer>` 是 ProwlarrExtend 使用的独立虚拟站点标识，不会接管 JackettExtend 站点。
 
+## 虚拟分身与诊断接口
+
+同类插件的虚拟分身按运行实例 ID 隔离搜索桥接和虚拟站点，可分别连接不同的 Jackett 或 Prowlarr 服务。源实例保留已有站点标识；修改分身显示名称不会改变站点归属。禁用一个实例只清理该实例管理的站点。
+
+两个插件均提供只读 `/status` 和 `/test` 接口，完整路径为 `/api/v1/plugin/<实例ID>/status` 和 `/api/v1/plugin/<实例ID>/test`。接口保留 API Key 认证和原有裸 JSON 结构，响应字段由具体模型校验，并可在宿主 OpenAPI 中查看。`/test` 会向对应服务发起连接探测；`/status` 只读取缓存状态。返回数据不包含服务地址、API Key 或登录密码。
+
 ## 目录结构
 
 ```text
 plugins.v3/jackettextend/   # JackettExtend V3 插件
 plugins.v3/prowlarrextend/  # ProwlarrExtend V3 插件
 package.v3.json             # V3 插件市场信息
-tests/                      # 自动化测试
+tests/v3/                   # V3 插件及宿主集成测试
+tests/ci/                   # 仓库元数据与共享模块检查
 ```
+
+## 开发验证
+
+将官方 MoviePilot V3 宿主放在本仓库同级的 `MoviePilot/`，使用其锁定依赖环境运行：
+
+```bash
+../MoviePilot/.venv/bin/python tests/run.py -q
+../MoviePilot/.venv/bin/python tools/sync_shared_modules.py --check
+```
+
+宿主位于其它目录时，设置 `MOVIEPILOT_BACKEND_PATH` 并使用该宿主的 Python 解释器。测试复用宿主共享引导，强制使用临时配置目录，并拦截真实网络请求；仓库检查与 V3 测试在独立进程中执行。
 
 ## 免责声明
 

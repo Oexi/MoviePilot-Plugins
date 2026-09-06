@@ -25,8 +25,19 @@ class SiteRegistryAdapter:
     def get_by_domain(self, domain: str):
         return self._site_oper.get_by_domain(domain)
 
-    def add(self, **payload: Any):
-        return self._site_oper.add(**payload)
+    def add(self, **payload: Any) -> bool:
+        """Add a site and normalize MoviePilot's public Oper result contract.
+
+        Current V3 ``SiteOper.add`` returns ``(success, message)``.  Older
+        compatible hosts/test doubles may return ``bool`` or ``None``; treat
+        an unstructured non-bool result as success to preserve that behavior.
+        """
+        result = self._site_oper.add(**payload)
+        if isinstance(result, tuple) and result and isinstance(result[0], bool):
+            return result[0]
+        if isinstance(result, bool):
+            return result
+        return True
 
     def update(self, site_id: object, payload: dict):
         return self._site_oper.update(site_id, payload)

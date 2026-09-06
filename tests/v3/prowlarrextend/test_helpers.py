@@ -1,32 +1,16 @@
 import copy
-import importlib.util
-import sys
-import types
 import unittest
 import xml.dom.minidom
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from importlib import import_module
 
-ROOT = Path(__file__).resolve().parents[1]
-PACKAGE = ROOT / "plugins.v3" / "prowlarrextend"
+
+ROOT = Path(__file__).resolve().parents[3]
 FIXTURES = ROOT / "tests" / "fixtures"
-PACKAGE_NAME = "prowlarrextend_helpers_testpkg"
-PACKAGE_MODULE = types.ModuleType(PACKAGE_NAME)
-PACKAGE_MODULE.__path__ = [str(PACKAGE)]
-sys.modules[PACKAGE_NAME] = PACKAGE_MODULE
-
-
-def load_helper(filename, name):
-    spec = importlib.util.spec_from_file_location(f"{PACKAGE_NAME}.{name}", PACKAGE / filename)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-INDEXERS = load_helper("_indexers.py", "prowlarrextend_indexers_isolated")
-TORZNAB = load_helper("_torznab.py", "prowlarrextend_torznab_isolated")
+INDEXERS = import_module("app.plugins.prowlarrextend._indexers")
+TORZNAB = import_module("app.plugins.prowlarrextend._torznab")
 
 
 class ProwlarrIndexerHelperTest(unittest.TestCase):
@@ -169,23 +153,7 @@ class ProwlarrTorznabHelperTest(unittest.TestCase):
 
 class ProwlarrUiHelperTest(unittest.TestCase):
     def test_form_has_current_configuration_only_and_prewires_port(self):
-        # Relative import requires a tiny package shim, while still avoiding
-        # any MoviePilot module installation.
-        package = types.ModuleType("prowlarrextend_ui_pkg")
-        package.__path__ = [str(PACKAGE)]
-        sys.modules[package.__name__] = package
-        indexer_spec = importlib.util.spec_from_file_location(
-            "prowlarrextend_ui_pkg._indexers", PACKAGE / "_indexers.py"
-        )
-        indexer_module = importlib.util.module_from_spec(indexer_spec)
-        sys.modules[indexer_spec.name] = indexer_module
-        indexer_spec.loader.exec_module(indexer_module)
-        spec = importlib.util.spec_from_file_location(
-            "prowlarrextend_ui_pkg._ui", PACKAGE / "_ui.py"
-        )
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
+        module = import_module("app.plugins.prowlarrextend._ui")
         form, defaults = module.build_form([{"title": "Public (42)", "value": "42"}])
         models = []
         texts = []
